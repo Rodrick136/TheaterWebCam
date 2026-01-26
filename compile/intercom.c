@@ -5,6 +5,9 @@
 static GstElement *g_pipeline = NULL;
 static GMainLoop *g_main_loop = NULL;
 
+// Forward declaration for audio configuration
+static void configure_audio(void);
+
 static gboolean is_display_window_closed(const GError *err)
 {
     return err && err->message && g_strrstr(err->message, "window was closed") != NULL;
@@ -12,7 +15,7 @@ static gboolean is_display_window_closed(const GError *err)
 
 static void signal_handler(int signum)
 {
-    g_print("Received signal %d, cleaning up...\n", signum);
+    g_print("\nReceived signal %d, cleaning up...\n", signum);
 
     if (g_main_loop) {
         g_main_loop_quit(g_main_loop);
@@ -57,7 +60,6 @@ char *start_cam(char *device_path, int should_record, char *video_size)
 {
     GstElement *source, *convert, *tee, *display_queue, *record_queue;
     GstElement *display_sink, *encoder, *video_muxer, *video_file_sink;
-    GstElement *audio_src, *audio_convert, *audio_resample, *audio_queue, *audio_encoder, *audio_file_sink;
     GstBus *bus;
     GstPad *tee_display_pad, *tee_record_pad;
     GstPad *queue_display_pad, *queue_record_pad;
@@ -193,51 +195,8 @@ char *start_cam(char *device_path, int should_record, char *video_size)
             return "Failed to link video recording pipeline";
         }
 
-        // Create audio elements
-        audio_src = gst_element_factory_make("pulsesrc", "audio_src");
-        audio_convert = gst_element_factory_make("audioconvert", "audio_convert");
-        audio_resample = gst_element_factory_make("audioresample", "audio_resample");
-        audio_queue = gst_element_factory_make("queue", "audio_queue");
-        audio_encoder = gst_element_factory_make("lamemp3enc", "audio_encoder");
-        audio_file_sink = gst_element_factory_make("filesink", "audio_file_sink");
-
-        if (!audio_src || !audio_convert || !audio_resample || !audio_queue || !audio_encoder || !audio_file_sink) {
-            g_printerr("Failed to create audio elements. Audio will be disabled.\n");
-            audio_src = NULL;
-        } else {
-            // Configure audio source
-            g_object_set(audio_src,
-                "do-timestamp", TRUE,
-                "provide-clock", FALSE,
-                "buffer-time", (gint64)200000,
-                NULL);
-
-            // Configure audio queue
-            g_object_set(audio_queue,
-                "max-size-buffers", 200,
-                "leaky", 2,
-                NULL);
-
-            // Configure audio filesink
-            g_object_set(audio_file_sink,
-                "location", "webcam_audio.mp3",
-                "async", FALSE,
-                NULL);
-
-            // Add audio elements to pipeline
-            gst_bin_add_many(GST_BIN(g_pipeline), audio_src, audio_convert,
-                           audio_resample, audio_queue, audio_encoder, audio_file_sink, NULL);
-
-            // Link audio recording: audio_src -> audio_convert -> audio_resample -> audio_queue -> audio_encoder -> audio_file_sink
-            if (!gst_element_link_many(audio_src, audio_convert, audio_resample,
-                                      audio_queue, audio_encoder, audio_file_sink, NULL)) {
-                g_printerr("Failed to link audio recording pipeline.\n");
-                gst_object_unref(g_pipeline);
-                return "Failed to link audio recording pipeline";
-            }
-
-            g_print("Audio recording enabled (default input device)\n");
-        }
+        // Configure and attach audio recording branch (non-fatal on failure)
+        configure_audio();
     }
 
     // Add a bus watch
@@ -284,4 +243,110 @@ char *start_cam(char *device_path, int should_record, char *video_size)
     g_main_loop_unref(g_main_loop);
 
     return NULL;
+}
+
+
+static void configure_audio(void)
+{
+    GstElement *voice_src, *voice_convert, *voice_resample, *voice_queue, *voice_encoder, *voice_file_sink;
+    GstElement *fx_src, *fx_convert, *fx_resample, *fx_queue, *fx_encoder, *fx_file_sink;
+
+    // Create Voice input: prefer PipeWire, fallback to PulseAudio
+    voice_src = gst_element_factory_make("pipewiresrc", "voice_src");
+    if (!voice_src) {
+        voice_src = gst_element_factory_make("pulsesrc", "voice_src");
+    }
+    
+
+    // Create Effects input: prefer PipeWire, fallback to PulseAudio
+    fx_src = gst_element_factory_make("pipewiresrc", "fx_src");
+    if (!fx_src) {
+        fx_src = gst_element_factory_make("pulsesrc", "fx_src");
+    }
+    
+
+    if (!voice_src && !fx_src) {
+        g_printerr("No audio sources available; audio disabled.\n");
+        return;
+    }
+
+    // Voice branch
+    if (voice_src) {
+        voice_convert = gst_element_factory_make("audioconvert", "voice_convert");
+        voice_resample = gst_element_factory_make("audioresample", "voice_resample");
+        voice_queue = gst_element_factory_make("queue", "voice_audio_queue");
+        voice_encoder = gst_element_factory_make("lamemp3enc", "voice_audio_encoder");
+        voice_file_sink = gst_element_factory_make("filesink", "voice_audio_file_sink");
+
+        if (!voice_convert || !voice_resample || !voice_queue || !voice_encoder || !voice_file_sink) {
+            g_printerr("Failed to create voice audio elements. Voice audio disabled.\n");
+        } else {
+            g_object_set(voice_src,
+                "client-name", "Voice In",
+                "do-timestamp", TRUE,
+                "provide-clock", FALSE,
+                "buffer-time", (gint64)200000,
+                NULL);
+
+            g_object_set(voice_queue,
+                "max-size-buffers", 200,
+                "leaky", 2,
+                NULL);
+
+            g_object_set(voice_file_sink,
+                "location", "webcam_voice.mp3",
+                "async", FALSE,
+                NULL);
+
+            gst_bin_add_many(GST_BIN(g_pipeline), voice_src, voice_convert,
+                             voice_resample, voice_queue, voice_encoder, voice_file_sink, NULL);
+
+            if (!gst_element_link_many(voice_src, voice_convert, voice_resample,
+                                      voice_queue, voice_encoder, voice_file_sink, NULL)) {
+                g_printerr("Failed to link voice audio pipeline. Voice audio disabled.\n");
+            } else {
+                g_print("Voice audio input exposed (patch via qpwgraph).\n");
+            }
+        }
+    }
+
+    // Effects branch
+    if (fx_src) {
+        fx_convert = gst_element_factory_make("audioconvert", "fx_convert");
+        fx_resample = gst_element_factory_make("audioresample", "fx_resample");
+        fx_queue = gst_element_factory_make("queue", "fx_audio_queue");
+        fx_encoder = gst_element_factory_make("lamemp3enc", "fx_audio_encoder");
+        fx_file_sink = gst_element_factory_make("filesink", "fx_audio_file_sink");
+
+        if (!fx_convert || !fx_resample || !fx_queue || !fx_encoder || !fx_file_sink) {
+            g_printerr("Failed to create effects audio elements. Effects audio disabled.\n");
+        } else {
+            g_object_set(fx_src,
+                "client-name", "Effects In",
+                "do-timestamp", TRUE,
+                "provide-clock", FALSE,
+                "buffer-time", (gint64)200000,
+                NULL);
+
+            g_object_set(fx_queue,
+                "max-size-buffers", 200,
+                "leaky", 2,
+                NULL);
+
+            g_object_set(fx_file_sink,
+                "location", "webcam_effects.mp3",
+                "async", FALSE,
+                NULL);
+
+            gst_bin_add_many(GST_BIN(g_pipeline), fx_src, fx_convert,
+                             fx_resample, fx_queue, fx_encoder, fx_file_sink, NULL);
+
+            if (!gst_element_link_many(fx_src, fx_convert, fx_resample,
+                                      fx_queue, fx_encoder, fx_file_sink, NULL)) {
+                g_printerr("Failed to link effects audio pipeline. Effects audio disabled.\n");
+            } else {
+                g_print("Effects audio input exposed (patch via qpwgraph).\n");
+            }
+        }
+    }
 }

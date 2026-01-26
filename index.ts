@@ -8,6 +8,7 @@ const { values, positionals } = parseArgs({
     record: {
       type: "boolean",
       short: "r",
+      default: false
     },
     focus: {
       type: "string",
@@ -23,7 +24,7 @@ const { values, positionals } = parseArgs({
   strict: true,
   allowPositionals: true,
 });
-const RECORD = !!values.record;
+const RECORD = values.record;
 
 const FOCUS = Number.parseInt(values.focus);
 if (Number.isNaN(FOCUS)) {
