@@ -9,8 +9,7 @@ static GstElement *g_fx_pipeline = NULL;     // Separate pipeline for effects au
 
 
 // Forward declarations
-static void configure_voice(void);
-static void configure_fx(void);
+static void configure_audio_pipeline(const char *name, const char *client_name, const char *output_file, GstElement **pipeline_ptr);
 static char *setup_display_branch(GstElement *tee, GstElement *display_queue, GstElement *display_sink);
 static char *setup_recording_branch(GstElement *tee);
 
@@ -342,130 +341,114 @@ static char *setup_recording_branch(GstElement *tee)
     }
 
     // Configure and attach audio recording branch (non-fatal on failure)
-    configure_voice();
-    configure_fx();
+    configure_audio_pipeline("Voice", "Voice In", "webcam_voice.mp3", &g_voice_pipeline);
+    configure_audio_pipeline("Effects", "Effects In", "webcam_effects.mp3", &g_fx_pipeline);
 
     return NULL;
 }
 
-static void configure_voice(void) 
+static gboolean audio_bus_callback(GstBus *bus, GstMessage *message, gpointer data)
 {
-    GstElement *voice_src, *voice_convert, *voice_resample, *voice_encoder, *voice_file_sink;
-
-    // Create SEPARATE Voice Pipeline
-    voice_src = gst_element_factory_make("pipewiresrc", "voice_src");
-    if (!voice_src) {
-        voice_src = gst_element_factory_make("pulsesrc", "voice_src");
-    }
-
-    if (voice_src) {
-        voice_convert = gst_element_factory_make("audioconvert", "voice_convert");
-        voice_resample = gst_element_factory_make("audioresample", "voice_resample");
-        voice_encoder = gst_element_factory_make("lamemp3enc", "voice_audio_encoder");
-        voice_file_sink = gst_element_factory_make("filesink", "voice_audio_file_sink");
-
-        if (voice_convert && voice_resample && voice_encoder && voice_file_sink) {
-            // Create independent pipeline for voice
-            g_voice_pipeline = gst_pipeline_new("voice-audio-pipeline");
-
-            // Configure source
-            GParamSpec *ps;
-            ps = g_object_class_find_property(G_OBJECT_GET_CLASS(voice_src), "client-name");
-            if (ps) {
-                g_object_set(voice_src, "client-name", "Voice In", NULL);
+    const char *name = (const char*)data;
+    switch (GST_MESSAGE_TYPE(message)) {
+        case GST_MESSAGE_ERROR: {
+            GError *err;
+            gchar *debug;
+            gst_message_parse_error(message, &err, &debug);
+            g_printerr("[%s Audio] Error: %s\n", name, err->message);
+            if (debug) {
+                g_printerr("[%s Audio] Debug: %s\n", name, debug);
             }
-
-            g_object_set(voice_file_sink, "location", "webcam_voice.mp3", NULL);
-
-            // Add elements to voice pipeline
-            gst_bin_add_many(GST_BIN(g_voice_pipeline), voice_src, voice_convert,
-                             voice_resample, voice_encoder, voice_file_sink, NULL);
-
-            // Link voice pipeline
-            if (gst_element_link_many(voice_src, voice_convert, voice_resample,
-                                      voice_encoder, voice_file_sink, NULL)) {
-                // Start voice pipeline independently (async is OK for live sources)
-                GstStateChangeReturn ret = gst_element_set_state(g_voice_pipeline, GST_STATE_PLAYING);
-                if (ret == GST_STATE_CHANGE_FAILURE) {
-                    g_printerr("Failed to start voice audio pipeline.\n");
-                    gst_object_unref(g_voice_pipeline);
-                    g_voice_pipeline = NULL;
-                } else {
-                    g_print("Voice audio pipeline started (patch via qpwgraph).\n");
-                }
-            } else {
-                g_printerr("Failed to link voice audio pipeline.\n");
-                gst_object_unref(g_voice_pipeline);
-                g_voice_pipeline = NULL;
-            }
-        } else {
-            g_printerr("Failed to create voice audio elements.\n");
+            g_error_free(err);
+            g_free(debug);
+            break;
         }
+        case GST_MESSAGE_WARNING: {
+            GError *err;
+            gchar *debug;
+            gst_message_parse_warning(message, &err, &debug);
+            g_printerr("[%s Audio] Warning: %s\n", name, err->message);
+            g_error_free(err);
+            g_free(debug);
+            break;
+        }
+        case GST_MESSAGE_EOS:
+            g_print("[%s Audio] End of stream\n", name);
+            break;
+        default:
+            break;
     }
-
-    if (!g_voice_pipeline) {
-        g_printerr("No voice pipeline available;\n");
-    }
-
+    return TRUE;
 }
 
-static void configure_fx(void)
+static void configure_audio_pipeline(const char *name, const char *client_name, const char *output_file, GstElement **pipeline_ptr)
 {
-    GstElement *fx_src, *fx_convert, *fx_resample, *fx_encoder, *fx_file_sink;
+    GstElement *audio_src, *audio_convert, *audio_resample, *audio_encoder, *audio_file_sink;
+    char pipeline_name[64];
 
+    snprintf(pipeline_name, sizeof(pipeline_name), "%s-audio-pipeline", name);
 
-    // Create SEPARATE Effects Pipeline
-    fx_src = gst_element_factory_make("pipewiresrc", "fx_src");
-    if (!fx_src) {
-        fx_src = gst_element_factory_make("pulsesrc", "fx_src");
+    // Pipeline: audio source -> convert -> resample -> encoder -> file
+    // Use pipewiresrc/pulsesrc directly so we can set client-name
+    audio_src = gst_element_factory_make("pipewiresrc", NULL);
+    if (!audio_src) {
+        audio_src = gst_element_factory_make("pulsesrc", NULL);
     }
 
-    if (fx_src) {
-        fx_convert = gst_element_factory_make("audioconvert", "fx_convert");
-        fx_resample = gst_element_factory_make("audioresample", "fx_resample");
-        fx_encoder = gst_element_factory_make("lamemp3enc", "fx_audio_encoder");
-        fx_file_sink = gst_element_factory_make("filesink", "fx_audio_file_sink");
+    audio_convert = gst_element_factory_make("audioconvert", NULL);
+    audio_resample = gst_element_factory_make("audioresample", NULL);
+    audio_encoder = gst_element_factory_make("lamemp3enc", NULL);
+    audio_file_sink = gst_element_factory_make("filesink", NULL);
 
-        if (fx_convert && fx_resample && fx_encoder && fx_file_sink) {
-            // Create independent pipeline for effects
-            g_fx_pipeline = gst_pipeline_new("fx-audio-pipeline");
-
-            // Configure source
-            GParamSpec *ps;
-            ps = g_object_class_find_property(G_OBJECT_GET_CLASS(fx_src), "client-name");
-            if (ps) {
-                g_object_set(fx_src, "client-name", "Effects In", NULL);
-            }
-
-            g_object_set(fx_file_sink, "location", "webcam_effects.mp3", NULL);
-
-            // Add elements to effects pipeline
-            gst_bin_add_many(GST_BIN(g_fx_pipeline), fx_src, fx_convert,
-                             fx_resample, fx_encoder, fx_file_sink, NULL);
-
-            // Link effects pipeline
-            if (gst_element_link_many(fx_src, fx_convert, fx_resample,
-                                      fx_encoder, fx_file_sink, NULL)) {
-                // Start effects pipeline independently (async is OK for live sources)
-                GstStateChangeReturn ret = gst_element_set_state(g_fx_pipeline, GST_STATE_PLAYING);
-                if (ret == GST_STATE_CHANGE_FAILURE) {
-                    g_printerr("Failed to start effects audio pipeline.\n");
-                    gst_object_unref(g_fx_pipeline);
-                    g_fx_pipeline = NULL;
-                } else {
-                    g_print("Effects audio pipeline started (patch via qpwgraph).\n");
-                }
-            } else {
-                g_printerr("Failed to link effects audio pipeline.\n");
-                gst_object_unref(g_fx_pipeline);
-                g_fx_pipeline = NULL;
-            }
-        } else {
-            g_printerr("Failed to create effects audio elements.\n");
-        }
+    if (!audio_src || !audio_convert || !audio_resample || !audio_encoder || !audio_file_sink) {
+        g_printerr("Failed to create %s audio elements.\n", name);
+        return;
     }
 
-    if (!g_fx_pipeline) {
-        g_printerr("No fx pipeline available;\n");
+    // Set client name for the audio source (for qpwgraph visibility)
+    g_object_set(audio_src, "client-name", client_name, NULL);
+
+    // Create the pipeline
+    *pipeline_ptr = gst_pipeline_new(pipeline_name);
+
+    // Configure encoder
+    g_object_set(audio_encoder,
+        "bitrate", 128,
+        "cbr", TRUE,
+        NULL);
+
+    g_object_set(audio_file_sink,
+        "location", output_file,
+        "sync", FALSE,
+        NULL);
+
+    // Add bus watch for debugging
+    GstBus *bus = gst_element_get_bus(*pipeline_ptr);
+    gst_bus_add_watch(bus, audio_bus_callback, (gpointer)name);
+    gst_object_unref(bus);
+
+    // Add elements to pipeline
+    gst_bin_add_many(GST_BIN(*pipeline_ptr),
+                     audio_src, audio_convert, audio_resample,
+                     audio_encoder, audio_file_sink,
+                     NULL);
+
+    // Link simple chain: source -> convert -> resample -> encoder -> file
+    if (!gst_element_link_many(audio_src, audio_convert, audio_resample,
+                              audio_encoder, audio_file_sink, NULL)) {
+        g_printerr("Failed to link %s audio pipeline.\n", name);
+        gst_object_unref(*pipeline_ptr);
+        *pipeline_ptr = NULL;
+        return;
+    }
+
+    // Start pipeline
+    GstStateChangeReturn ret = gst_element_set_state(*pipeline_ptr, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        g_printerr("Failed to start %s audio pipeline.\n", name);
+        gst_object_unref(*pipeline_ptr);
+        *pipeline_ptr = NULL;
+    } else {
+        g_print("%s audio test tone pipeline started - recording to %s\n", name, output_file);
     }
 }
