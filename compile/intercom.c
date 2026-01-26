@@ -347,108 +347,70 @@ static char *setup_recording_branch(GstElement *tee)
     return NULL;
 }
 
-static gboolean audio_bus_callback(GstBus *bus, GstMessage *message, gpointer data)
-{
-    const char *name = (const char*)data;
-    switch (GST_MESSAGE_TYPE(message)) {
-        case GST_MESSAGE_ERROR: {
-            GError *err;
-            gchar *debug;
-            gst_message_parse_error(message, &err, &debug);
-            g_printerr("[%s Audio] Error: %s\n", name, err->message);
-            if (debug) {
-                g_printerr("[%s Audio] Debug: %s\n", name, debug);
-            }
-            g_error_free(err);
-            g_free(debug);
-            break;
-        }
-        case GST_MESSAGE_WARNING: {
-            GError *err;
-            gchar *debug;
-            gst_message_parse_warning(message, &err, &debug);
-            g_printerr("[%s Audio] Warning: %s\n", name, err->message);
-            g_error_free(err);
-            g_free(debug);
-            break;
-        }
-        case GST_MESSAGE_EOS:
-            g_print("[%s Audio] End of stream\n", name);
-            break;
-        default:
-            break;
-    }
-    return TRUE;
-}
-
 static void configure_audio_pipeline(const char *name, const char *client_name, const char *output_file, GstElement **pipeline_ptr)
 {
-    GstElement *audio_src, *audio_convert, *audio_resample, *audio_encoder, *audio_file_sink;
+    GstElement *src, *convert, *resample, *encoder, *file_sink;
     char pipeline_name[64];
 
     snprintf(pipeline_name, sizeof(pipeline_name), "%s-audio-pipeline", name);
 
-    // Pipeline: audio source -> convert -> resample -> encoder -> file
-    // Use pipewiresrc/pulsesrc directly so we can set client-name
-    audio_src = gst_element_factory_make("pipewiresrc", NULL);
-    if (!audio_src) {
-        audio_src = gst_element_factory_make("pulsesrc", NULL);
-    }
+    // Simple pipeline: autoaudiosrc -> convert -> resample -> encoder -> file
+    src = gst_element_factory_make("autoaudiosrc", "source");
+    convert = gst_element_factory_make("audioconvert", NULL);
+    resample = gst_element_factory_make("audioresample", NULL);
+    encoder = gst_element_factory_make("lamemp3enc", NULL);
+    file_sink = gst_element_factory_make("filesink", NULL);
 
-    audio_convert = gst_element_factory_make("audioconvert", NULL);
-    audio_resample = gst_element_factory_make("audioresample", NULL);
-    audio_encoder = gst_element_factory_make("lamemp3enc", NULL);
-    audio_file_sink = gst_element_factory_make("filesink", NULL);
-
-    if (!audio_src || !audio_convert || !audio_resample || !audio_encoder || !audio_file_sink) {
+    if (!src || !convert || !resample || !encoder || !file_sink) {
         g_printerr("Failed to create %s audio elements.\n", name);
         return;
     }
-
-    // Set client name for the audio source (for qpwgraph visibility)
-    g_object_set(audio_src, "client-name", client_name, NULL);
 
     // Create the pipeline
     *pipeline_ptr = gst_pipeline_new(pipeline_name);
 
     // Configure encoder
-    g_object_set(audio_encoder,
+    g_object_set(encoder,
+        "target", 1,
         "bitrate", 128,
         "cbr", TRUE,
         NULL);
 
-    g_object_set(audio_file_sink,
+    // Configure file sink
+    g_object_set(file_sink,
         "location", output_file,
         "sync", FALSE,
         NULL);
 
-    // Add bus watch for debugging
-    GstBus *bus = gst_element_get_bus(*pipeline_ptr);
-    gst_bus_add_watch(bus, audio_bus_callback, (gpointer)name);
-    gst_object_unref(bus);
-
     // Add elements to pipeline
     gst_bin_add_many(GST_BIN(*pipeline_ptr),
-                     audio_src, audio_convert, audio_resample,
-                     audio_encoder, audio_file_sink,
+                     src, convert, resample,
+                     encoder, file_sink,
                      NULL);
 
-    // Link simple chain: source -> convert -> resample -> encoder -> file
-    if (!gst_element_link_many(audio_src, audio_convert, audio_resample,
-                              audio_encoder, audio_file_sink, NULL)) {
+    // Link: source -> convert -> resample -> encoder -> file
+    if (!gst_element_link_many(src, convert, resample,
+                              encoder, file_sink, NULL)) {
         g_printerr("Failed to link %s audio pipeline.\n", name);
         gst_object_unref(*pipeline_ptr);
         *pipeline_ptr = NULL;
         return;
     }
 
-    // Start pipeline
+    g_print("[%s Audio] Pipeline created successfully\n", name);
+
+    // Try to configure autoaudiosrc with device and client name properties
+    // These need to be set BEFORE the pipeline goes to READY
+    g_object_set(src, "client-name", client_name, NULL);
+    g_print("[%s Audio] Set client-name property on autoaudiosrc\n", name);
+
+    // Now start the pipeline
     GstStateChangeReturn ret = gst_element_set_state(*pipeline_ptr, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         g_printerr("Failed to start %s audio pipeline.\n", name);
         gst_object_unref(*pipeline_ptr);
         *pipeline_ptr = NULL;
     } else {
-        g_print("%s audio test tone pipeline started - recording to %s\n", name, output_file);
+        g_print("[%s Audio] Started - recording to %s\n", name, output_file);
     }
 }
