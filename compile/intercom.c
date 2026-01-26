@@ -5,8 +5,10 @@
 static GstElement *g_pipeline = NULL;
 static GMainLoop *g_main_loop = NULL;
 
-// Forward declaration for audio configuration
+// Forward declarations
 static void configure_audio(void);
+static char *setup_display_branch(GstElement *tee, GstElement *display_queue, GstElement *display_sink);
+static char *setup_recording_branch(GstElement *tee);
 
 static gboolean is_display_window_closed(const GError *err)
 {
@@ -58,12 +60,10 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer data)
 // video_size of the device to be set, passes /^\d+x\d+$/
 char *start_cam(char *device_path, int should_record, char *video_size)
 {
-    GstElement *source, *convert, *tee, *display_queue, *record_queue;
-    GstElement *display_sink, *encoder, *video_muxer, *video_file_sink;
-    GstElement *capsfilter; // NEW: capsfilter for width/height negotiation
+    GstElement *source, *convert, *tee, *display_queue, *display_sink;
+    GstElement *capsfilter; // capsfilter for width/height negotiation
     GstBus *bus;
-    GstPad *tee_display_pad, *tee_record_pad;
-    GstPad *queue_display_pad, *queue_record_pad;
+    char *error;
 
     // Initialize GStreamer
     gst_init(NULL, NULL);
@@ -88,6 +88,12 @@ char *start_cam(char *device_path, int should_record, char *video_size)
     g_object_set(source,
         "device", device_path,
         "do-timestamp", TRUE,    // Use pipeline clock for timestamps
+        "io-mode", 2,            // Prefer MMAP for lower overhead if supported
+        NULL);
+
+    // Enable QoS so transforms can drop late frames
+    g_object_set(convert,
+        "qos", TRUE,
         NULL);
 
     // Parse and set video size via capsfilter (not on v4l2src)
@@ -110,13 +116,6 @@ char *start_cam(char *device_path, int should_record, char *video_size)
         "allow-not-linked", TRUE,    // Don't fail if a branch returns not-linked
         NULL);
 
-    // Configure display queue for minimal latency
-    g_object_set(display_queue,
-        "max-size-buffers", 2,      // Keep only 2 frames buffered for low latency
-        "max-size-bytes", 0,         // Disable byte limit
-        "max-size-time", 0,          // Disable time limit
-        NULL);
-
     // Add basic elements to pipeline
     gst_bin_add_many(GST_BIN(g_pipeline), source, capsfilter, convert, tee, display_queue, display_sink, NULL);
 
@@ -127,79 +126,20 @@ char *start_cam(char *device_path, int should_record, char *video_size)
         return "Failed to link GStreamer elements";
     }
 
-    // Link display branch: tee -> display_queue -> display_sink
-    tee_display_pad = gst_element_request_pad_simple(tee, "src_%u");
-    queue_display_pad = gst_element_get_static_pad(display_queue, "sink");
-    if (gst_pad_link(tee_display_pad, queue_display_pad) != GST_PAD_LINK_OK) {
-        g_printerr("Failed to link tee to display queue.\n");
+    // Setup display branch
+    error = setup_display_branch(tee, display_queue, display_sink);
+    if (error != NULL) {
         gst_object_unref(g_pipeline);
-        return "Failed to link display branch";
-    }
-    gst_object_unref(queue_display_pad);
-
-    if (!gst_element_link(display_queue, display_sink)) {
-        g_printerr("Failed to link display queue to sink.\n");
-        gst_object_unref(g_pipeline);
-        return "Failed to link display sink";
+        return error;
     }
 
-    // If recording is enabled, add separate video and audio recording
+    // If recording is enabled, setup recording branch
     if (should_record) {
-        g_print("Recording enabled - video: webcam_video.mp4, audio: webcam_audio.mp3\n");
-
-        // Create video recording elements
-        record_queue = gst_element_factory_make("queue", "record_queue");
-        encoder = gst_element_factory_make("x264enc", "encoder");
-        video_muxer = gst_element_factory_make("mp4mux", "video_muxer");
-        video_file_sink = gst_element_factory_make("filesink", "video_file_sink");
-
-        if (!record_queue || !encoder || !video_muxer || !video_file_sink) {
-            g_printerr("Failed to create video recording elements.\n");
+        error = setup_recording_branch(tee);
+        if (error != NULL) {
             gst_object_unref(g_pipeline);
-            return "Failed to create video recording elements";
+            return error;
         }
-
-        // Configure recording queue - leaky to prevent blocking
-        g_object_set(record_queue,
-            "max-size-buffers", 200,
-            "max-size-bytes", 0,
-            "max-size-time", 0,
-            "leaky", 2,
-            NULL);
-
-        // Configure encoder
-        g_object_set(encoder,
-            "speed-preset", 6,          // Medium preset (0=ultrafast, 10=veryslow)
-            "bitrate", 2048,            // 2 Mbps for good quality
-            NULL);
-
-        // Configure video filesink
-        g_object_set(video_file_sink,
-            "location", "webcam_video.mp4",
-            "async", FALSE,
-            NULL);
-
-        // Add video recording elements to pipeline
-        gst_bin_add_many(GST_BIN(g_pipeline), record_queue, encoder, video_muxer, video_file_sink, NULL);
-
-        // Link video recording: tee -> record_queue -> encoder -> video_muxer -> video_file_sink
-        tee_record_pad = gst_element_request_pad_simple(tee, "src_%u");
-        queue_record_pad = gst_element_get_static_pad(record_queue, "sink");
-        if (gst_pad_link(tee_record_pad, queue_record_pad) != GST_PAD_LINK_OK) {
-            g_printerr("Failed to link tee to record queue.\n");
-            gst_object_unref(g_pipeline);
-            return "Failed to link record branch";
-        }
-        gst_object_unref(queue_record_pad);
-
-        if (!gst_element_link_many(record_queue, encoder, video_muxer, video_file_sink, NULL)) {
-            g_printerr("Failed to link video recording pipeline.\n");
-            gst_object_unref(g_pipeline);
-            return "Failed to link video recording pipeline";
-        }
-
-        // Configure and attach audio recording branch (non-fatal on failure)
-        configure_audio();
     }
 
     // Add a bus watch
@@ -248,6 +188,122 @@ char *start_cam(char *device_path, int should_record, char *video_size)
     return NULL;
 }
 
+static char *setup_display_branch(GstElement *tee, GstElement *display_queue, GstElement *display_sink)
+{
+    GstPad *tee_display_pad, *queue_display_pad;
+
+    // Configure display queue for minimal latency
+    g_object_set(display_queue,
+        "max-size-buffers", 2,      // Keep only 2 frames buffered for low latency
+        "max-size-bytes", 0,         // Disable byte limit
+        "max-size-time", 0,          // Disable time limit
+        "leaky", 2,                  // Drop oldest buffers when downstream is late
+        NULL);
+
+    // Display ASAP without clock sync to minimize latency
+    g_object_set(display_sink,
+        "sync", FALSE,
+        "async", FALSE,      // Don't wait for preroll, prevents blocking when recording
+        NULL);
+
+    // Link display branch: tee -> display_queue -> display_sink
+    tee_display_pad = gst_element_request_pad_simple(tee, "src_%u");
+    queue_display_pad = gst_element_get_static_pad(display_queue, "sink");
+    if (gst_pad_link(tee_display_pad, queue_display_pad) != GST_PAD_LINK_OK) {
+        g_printerr("Failed to link tee to display queue.\n");
+        gst_object_unref(queue_display_pad);
+        return "Failed to link display branch";
+    }
+    gst_object_unref(queue_display_pad);
+
+    if (!gst_element_link(display_queue, display_sink)) {
+        g_printerr("Failed to link display queue to sink.\n");
+        return "Failed to link display sink";
+    }
+
+    return NULL;
+}
+
+static char *setup_recording_branch(GstElement *tee)
+{
+    GstElement *record_queue, *encoder, *video_muxer, *video_file_sink;
+    GstPad *tee_record_pad, *queue_record_pad;
+
+    g_print("Recording enabled - video: webcam_video.mp4\n");
+
+    // Create video recording elements
+    record_queue = gst_element_factory_make("queue", "record_queue");
+    encoder = gst_element_factory_make("x264enc", "encoder");
+    video_muxer = gst_element_factory_make("mp4mux", "video_muxer");
+    video_file_sink = gst_element_factory_make("filesink", "video_file_sink");
+
+    if (!record_queue || !encoder || !video_muxer || !video_file_sink) {
+        g_printerr("Failed to create video recording elements.\n");
+        return "Failed to create video recording elements";
+    }
+
+    // Configure recording queue - leaky to prevent blocking
+    g_object_set(record_queue,
+        "max-size-buffers", 200,
+        "max-size-bytes", 0,
+        "max-size-time", 0,
+        "leaky", 2,
+        NULL);
+
+    // Configure encoder for AVCC + low-latency
+    g_object_set(encoder,
+        "byte-stream", FALSE,       // AVCC format required by mp4mux
+        "speed-preset", 1,          // ultrafast
+        "bitrate", 2048,            // ~2 Mbps
+        "key-int-max", 30,          // frequent IDR
+        "bframes", 0,               // no reordering
+        "rc-lookahead", 0,          // no lookahead
+        NULL);
+    // Set tune=zerolatency if available (parse via util to avoid enum mismatch)
+    {
+        GParamSpec *ps = g_object_class_find_property(G_OBJECT_GET_CLASS(encoder), "tune");
+        if (ps) {
+            gst_util_set_object_arg(G_OBJECT(encoder), "tune", "zerolatency");
+        }
+    }
+
+    // Configure video filesink
+    g_object_set(video_file_sink,
+        "location", "webcam_video.mp4",
+        "async", FALSE,
+        NULL);
+
+    // Optional: mp4mux faststart if supported
+    {
+        GParamSpec *ps = g_object_class_find_property(G_OBJECT_GET_CLASS(video_muxer), "faststart");
+        if (ps) {
+            g_object_set(video_muxer, "faststart", TRUE, NULL);
+        }
+    }
+
+    // Add video recording elements to pipeline
+    gst_bin_add_many(GST_BIN(g_pipeline), record_queue, encoder, video_muxer, video_file_sink, NULL);
+
+    // Link video recording: tee -> record_queue -> encoder -> video_muxer -> video_file_sink
+    tee_record_pad = gst_element_request_pad_simple(tee, "src_%u");
+    queue_record_pad = gst_element_get_static_pad(record_queue, "sink");
+    if (gst_pad_link(tee_record_pad, queue_record_pad) != GST_PAD_LINK_OK) {
+        g_printerr("Failed to link tee to record queue.\n");
+        gst_object_unref(queue_record_pad);
+        return "Failed to link record branch";
+    }
+    gst_object_unref(queue_record_pad);
+
+    if (!gst_element_link_many(record_queue, encoder, video_muxer, video_file_sink, NULL)) {
+        g_printerr("Failed to link video recording pipeline.\n");
+        return "Failed to link video recording pipeline";
+    }
+
+    // Configure and attach audio recording branch (non-fatal on failure)
+    configure_audio();
+
+    return NULL;
+}
 
 static void configure_audio(void)
 {
@@ -284,12 +340,23 @@ static void configure_audio(void)
         if (!voice_convert || !voice_resample || !voice_queue || !voice_encoder || !voice_file_sink) {
             g_printerr("Failed to create voice audio elements. Voice audio disabled.\n");
         } else {
+            // Set common properties, guarding for availability
             g_object_set(voice_src,
-                "client-name", "Voice In",
                 "do-timestamp", TRUE,
-                "provide-clock", FALSE,
-                "buffer-time", (gint64)200000,
                 NULL);
+            GParamSpec *ps;
+            ps = g_object_class_find_property(G_OBJECT_GET_CLASS(voice_src), "client-name");
+            if (ps) {
+                g_object_set(voice_src, "client-name", "Voice In", NULL);
+            }
+            ps = g_object_class_find_property(G_OBJECT_GET_CLASS(voice_src), "provide-clock");
+            if (ps) {
+                g_object_set(voice_src, "provide-clock", FALSE, NULL);
+            }
+            ps = g_object_class_find_property(G_OBJECT_GET_CLASS(voice_src), "buffer-time");
+            if (ps) {
+                g_object_set(voice_src, "buffer-time", (gint64)200000, NULL);
+            }
 
             g_object_set(voice_queue,
                 "max-size-buffers", 200,
@@ -324,12 +391,23 @@ static void configure_audio(void)
         if (!fx_convert || !fx_resample || !fx_queue || !fx_encoder || !fx_file_sink) {
             g_printerr("Failed to create effects audio elements. Effects audio disabled.\n");
         } else {
+            // Set common properties, guarding for availability
             g_object_set(fx_src,
-                "client-name", "Effects In",
                 "do-timestamp", TRUE,
-                "provide-clock", FALSE,
-                "buffer-time", (gint64)200000,
                 NULL);
+            GParamSpec *ps2;
+            ps2 = g_object_class_find_property(G_OBJECT_GET_CLASS(fx_src), "client-name");
+            if (ps2) {
+                g_object_set(fx_src, "client-name", "Effects In", NULL);
+            }
+            ps2 = g_object_class_find_property(G_OBJECT_GET_CLASS(fx_src), "provide-clock");
+            if (ps2) {
+                g_object_set(fx_src, "provide-clock", FALSE, NULL);
+            }
+            ps2 = g_object_class_find_property(G_OBJECT_GET_CLASS(fx_src), "buffer-time");
+            if (ps2) {
+                g_object_set(fx_src, "buffer-time", (gint64)200000, NULL);
+            }
 
             g_object_set(fx_queue,
                 "max-size-buffers", 200,
