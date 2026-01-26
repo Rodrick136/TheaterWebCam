@@ -79,5 +79,21 @@ if (result_ptr) {
   process.exit(1);
 }
 
-// start_cam blocks until Ctrl+C or an error occurs
-// The C code handles cleanup on exit
+// find latest recording directory
+/* if (RECORD) {
+  const RECORDING_DIR = (
+    await Bun.$`/usr/bin/ls -td ./Recording__* | head -n 1`.text()
+  ).trim();
+  console.log(`Latest recording saved in: ${RECORDING_DIR}`);
+
+  // use ffmpeg to combine video and audio
+  console.log("Combining video and audio into final output file...");
+  const VIDEO = RECORDING_DIR + "/webcam_video.mp4"; // no audio yet
+  const VOICE = RECORDING_DIR + "/webcam_voice.mp3"; // 2 channels
+  const EFFECTS = RECORDING_DIR + "/webcam_effects.mp3"; // 2 channels
+
+  const OUTPUT = RECORDING_DIR + "/final_output.mp4";
+  await Bun.$`ffmpeg -i ${VIDEO} -i ${VOICE} -i ${EFFECTS} -filter_complex "[1:a][2:a]amerge=inputs=2[aout]" -map 0:v -map "[aout]" -c:v copy -ac 4 -c:a aac ${OUTPUT} -y`;
+  console.log(`Final output saved in: ${OUTPUT}`);
+} */
+
