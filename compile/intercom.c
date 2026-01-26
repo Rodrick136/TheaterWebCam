@@ -2,11 +2,15 @@
 #include <signal.h>
 #include <gst/gst.h>
 
-static GstElement *g_pipeline = NULL;
 static GMainLoop *g_main_loop = NULL;
+static GstElement *g_pipeline = NULL;
+static GstElement *g_voice_pipeline = NULL;  // Separate pipeline for voice audio
+static GstElement *g_fx_pipeline = NULL;     // Separate pipeline for effects audio
+
 
 // Forward declarations
-static void configure_audio(void);
+static void configure_voice(void);
+static void configure_fx(void);
 static char *setup_display_branch(GstElement *tee, GstElement *display_queue, GstElement *display_sink);
 static char *setup_recording_branch(GstElement *tee);
 
@@ -165,9 +169,9 @@ char *start_cam(char *device_path, int should_record, char *video_size)
     g_main_loop_run(g_main_loop);
 
     // Cleanup - send EOS to properly finalize recording
-    g_print("Cleaning up GStreamer pipeline...\n");
+    g_print("Cleaning up GStreamer pipelines...\n");
 
-    // Send end-of-stream event to finalize files
+    // Send end-of-stream event to video pipeline to finalize files
     gst_element_send_event(g_pipeline, gst_event_new_eos());
 
     // Wait a bit for EOS to be processed
@@ -183,6 +187,36 @@ char *start_cam(char *device_path, int should_record, char *video_size)
 
     gst_element_set_state(g_pipeline, GST_STATE_NULL);
     gst_object_unref(g_pipeline);
+
+    // Cleanup audio pipelines if they exist
+    if (g_voice_pipeline) {
+        gst_element_send_event(g_voice_pipeline, gst_event_new_eos());
+        GstBus *voice_bus = gst_element_get_bus(g_voice_pipeline);
+        GstMessage *voice_msg = gst_bus_timed_pop_filtered(voice_bus,
+            2 * GST_SECOND,
+            GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
+        if (voice_msg) {
+            gst_message_unref(voice_msg);
+        }
+        gst_object_unref(voice_bus);
+        gst_element_set_state(g_voice_pipeline, GST_STATE_NULL);
+        gst_object_unref(g_voice_pipeline);
+    }
+
+    if (g_fx_pipeline) {
+        gst_element_send_event(g_fx_pipeline, gst_event_new_eos());
+        GstBus *fx_bus = gst_element_get_bus(g_fx_pipeline);
+        GstMessage *fx_msg = gst_bus_timed_pop_filtered(fx_bus,
+            2 * GST_SECOND,
+            GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
+        if (fx_msg) {
+            gst_message_unref(fx_msg);
+        }
+        gst_object_unref(fx_bus);
+        gst_element_set_state(g_fx_pipeline, GST_STATE_NULL);
+        gst_object_unref(g_fx_pipeline);
+    }
+
     g_main_loop_unref(g_main_loop);
 
     return NULL;
@@ -198,6 +232,11 @@ static char *setup_display_branch(GstElement *tee, GstElement *display_queue, Gs
         "max-size-bytes", 0,         // Disable byte limit
         "max-size-time", 0,          // Disable time limit
         "leaky", 2,                  // Drop oldest buffers when downstream is late
+        NULL);
+
+    // Display ASAP without clock sync to minimize latency
+    g_object_set(display_sink,
+        "sync", FALSE,
         NULL);
 
     // Link display branch: tee -> display_queue -> display_sink
@@ -220,7 +259,7 @@ static char *setup_display_branch(GstElement *tee, GstElement *display_queue, Gs
 
 static char *setup_recording_branch(GstElement *tee)
 {
-    GstElement *record_queue, *encoder, *video_muxer, *video_file_sink;
+    GstElement *record_queue, *encoder, *muxer_queue, *video_muxer, *video_file_sink;
     GstPad *tee_record_pad, *queue_record_pad;
 
     g_print("Recording enabled - video: webcam_video.mp4\n");
@@ -228,10 +267,11 @@ static char *setup_recording_branch(GstElement *tee)
     // Create video recording elements
     record_queue = gst_element_factory_make("queue", "record_queue");
     encoder = gst_element_factory_make("x264enc", "encoder");
+    muxer_queue = gst_element_factory_make("queue", "muxer_queue");  // Additional queue for decoupling
     video_muxer = gst_element_factory_make("mp4mux", "video_muxer");
     video_file_sink = gst_element_factory_make("filesink", "video_file_sink");
 
-    if (!record_queue || !encoder || !video_muxer || !video_file_sink) {
+    if (!record_queue || !encoder || !muxer_queue || !video_muxer || !video_file_sink) {
         g_printerr("Failed to create video recording elements.\n");
         return "Failed to create video recording elements";
     }
@@ -239,6 +279,14 @@ static char *setup_recording_branch(GstElement *tee)
     // Configure recording queue - leaky to prevent blocking
     g_object_set(record_queue,
         "max-size-buffers", 200,
+        "max-size-bytes", 0,
+        "max-size-time", 0,
+        "leaky", 2,
+        NULL);
+
+    // Configure muxer queue - also leaky to decouple muxer from encoder
+    g_object_set(muxer_queue,
+        "max-size-buffers", 100,
         "max-size-bytes", 0,
         "max-size-time", 0,
         "leaky", 2,
@@ -276,9 +324,9 @@ static char *setup_recording_branch(GstElement *tee)
     }
 
     // Add video recording elements to pipeline
-    gst_bin_add_many(GST_BIN(g_pipeline), record_queue, encoder, video_muxer, video_file_sink, NULL);
+    gst_bin_add_many(GST_BIN(g_pipeline), record_queue, encoder, muxer_queue, video_muxer, video_file_sink, NULL);
 
-    // Link video recording: tee -> record_queue -> encoder -> video_muxer -> video_file_sink
+    // Link video recording: tee -> record_queue -> encoder -> muxer_queue -> video_muxer -> video_file_sink
     tee_record_pad = gst_element_request_pad_simple(tee, "src_%u");
     queue_record_pad = gst_element_get_static_pad(record_queue, "sink");
     if (gst_pad_link(tee_record_pad, queue_record_pad) != GST_PAD_LINK_OK) {
@@ -288,140 +336,136 @@ static char *setup_recording_branch(GstElement *tee)
     }
     gst_object_unref(queue_record_pad);
 
-    if (!gst_element_link_many(record_queue, encoder, video_muxer, video_file_sink, NULL)) {
+    if (!gst_element_link_many(record_queue, encoder, muxer_queue, video_muxer, video_file_sink, NULL)) {
         g_printerr("Failed to link video recording pipeline.\n");
         return "Failed to link video recording pipeline";
     }
 
     // Configure and attach audio recording branch (non-fatal on failure)
-    configure_audio();
+    configure_voice();
+    configure_fx();
 
     return NULL;
 }
 
-static void configure_audio(void)
+static void configure_voice(void) 
 {
-    GstElement *voice_src, *voice_convert, *voice_resample, *voice_queue, *voice_encoder, *voice_file_sink;
-    GstElement *fx_src, *fx_convert, *fx_resample, *fx_queue, *fx_encoder, *fx_file_sink;
+    GstElement *voice_src, *voice_convert, *voice_resample, *voice_encoder, *voice_file_sink;
 
-    // Create Voice input: prefer PipeWire, fallback to PulseAudio
+    // Create SEPARATE Voice Pipeline
     voice_src = gst_element_factory_make("pipewiresrc", "voice_src");
     if (!voice_src) {
         voice_src = gst_element_factory_make("pulsesrc", "voice_src");
     }
-    
 
-    // Create Effects input: prefer PipeWire, fallback to PulseAudio
-    fx_src = gst_element_factory_make("pipewiresrc", "fx_src");
-    if (!fx_src) {
-        fx_src = gst_element_factory_make("pulsesrc", "fx_src");
-    }
-    
-
-    if (!voice_src && !fx_src) {
-        g_printerr("No audio sources available; audio disabled.\n");
-        return;
-    }
-
-    // Voice branch
     if (voice_src) {
         voice_convert = gst_element_factory_make("audioconvert", "voice_convert");
         voice_resample = gst_element_factory_make("audioresample", "voice_resample");
-        voice_queue = gst_element_factory_make("queue", "voice_audio_queue");
         voice_encoder = gst_element_factory_make("lamemp3enc", "voice_audio_encoder");
         voice_file_sink = gst_element_factory_make("filesink", "voice_audio_file_sink");
 
-        if (!voice_convert || !voice_resample || !voice_queue || !voice_encoder || !voice_file_sink) {
-            g_printerr("Failed to create voice audio elements. Voice audio disabled.\n");
-        } else {
-            // Set common properties, guarding for availability
-            g_object_set(voice_src,
-                "do-timestamp", TRUE,
-                NULL);
+        if (voice_convert && voice_resample && voice_encoder && voice_file_sink) {
+            // Create independent pipeline for voice
+            g_voice_pipeline = gst_pipeline_new("voice-audio-pipeline");
+
+            // Configure source
             GParamSpec *ps;
             ps = g_object_class_find_property(G_OBJECT_GET_CLASS(voice_src), "client-name");
             if (ps) {
                 g_object_set(voice_src, "client-name", "Voice In", NULL);
             }
-            ps = g_object_class_find_property(G_OBJECT_GET_CLASS(voice_src), "provide-clock");
-            if (ps) {
-                g_object_set(voice_src, "provide-clock", FALSE, NULL);
-            }
-            ps = g_object_class_find_property(G_OBJECT_GET_CLASS(voice_src), "buffer-time");
-            if (ps) {
-                g_object_set(voice_src, "buffer-time", (gint64)200000, NULL);
-            }
 
-            g_object_set(voice_queue,
-                "max-size-buffers", 200,
-                "leaky", 2,
-                NULL);
+            g_object_set(voice_file_sink, "location", "webcam_voice.mp3", NULL);
 
-            g_object_set(voice_file_sink,
-                "location", "webcam_voice.mp3",
-                "async", FALSE,
-                NULL);
+            // Add elements to voice pipeline
+            gst_bin_add_many(GST_BIN(g_voice_pipeline), voice_src, voice_convert,
+                             voice_resample, voice_encoder, voice_file_sink, NULL);
 
-            gst_bin_add_many(GST_BIN(g_pipeline), voice_src, voice_convert,
-                             voice_resample, voice_queue, voice_encoder, voice_file_sink, NULL);
-
-            if (!gst_element_link_many(voice_src, voice_convert, voice_resample,
-                                      voice_queue, voice_encoder, voice_file_sink, NULL)) {
-                g_printerr("Failed to link voice audio pipeline. Voice audio disabled.\n");
+            // Link voice pipeline
+            if (gst_element_link_many(voice_src, voice_convert, voice_resample,
+                                      voice_encoder, voice_file_sink, NULL)) {
+                // Start voice pipeline independently (async is OK for live sources)
+                GstStateChangeReturn ret = gst_element_set_state(g_voice_pipeline, GST_STATE_PLAYING);
+                if (ret == GST_STATE_CHANGE_FAILURE) {
+                    g_printerr("Failed to start voice audio pipeline.\n");
+                    gst_object_unref(g_voice_pipeline);
+                    g_voice_pipeline = NULL;
+                } else {
+                    g_print("Voice audio pipeline started (patch via qpwgraph).\n");
+                }
             } else {
-                g_print("Voice audio input exposed (patch via qpwgraph).\n");
+                g_printerr("Failed to link voice audio pipeline.\n");
+                gst_object_unref(g_voice_pipeline);
+                g_voice_pipeline = NULL;
             }
+        } else {
+            g_printerr("Failed to create voice audio elements.\n");
         }
     }
 
-    // Effects branch
+    if (!g_voice_pipeline) {
+        g_printerr("No voice pipeline available;\n");
+    }
+
+}
+
+static void configure_fx(void)
+{
+    GstElement *fx_src, *fx_convert, *fx_resample, *fx_encoder, *fx_file_sink;
+
+
+    // Create SEPARATE Effects Pipeline
+    fx_src = gst_element_factory_make("pipewiresrc", "fx_src");
+    if (!fx_src) {
+        fx_src = gst_element_factory_make("pulsesrc", "fx_src");
+    }
+
     if (fx_src) {
         fx_convert = gst_element_factory_make("audioconvert", "fx_convert");
         fx_resample = gst_element_factory_make("audioresample", "fx_resample");
-        fx_queue = gst_element_factory_make("queue", "fx_audio_queue");
         fx_encoder = gst_element_factory_make("lamemp3enc", "fx_audio_encoder");
         fx_file_sink = gst_element_factory_make("filesink", "fx_audio_file_sink");
 
-        if (!fx_convert || !fx_resample || !fx_queue || !fx_encoder || !fx_file_sink) {
-            g_printerr("Failed to create effects audio elements. Effects audio disabled.\n");
-        } else {
-            // Set common properties, guarding for availability
-            g_object_set(fx_src,
-                "do-timestamp", TRUE,
-                NULL);
-            GParamSpec *ps2;
-            ps2 = g_object_class_find_property(G_OBJECT_GET_CLASS(fx_src), "client-name");
-            if (ps2) {
+        if (fx_convert && fx_resample && fx_encoder && fx_file_sink) {
+            // Create independent pipeline for effects
+            g_fx_pipeline = gst_pipeline_new("fx-audio-pipeline");
+
+            // Configure source
+            GParamSpec *ps;
+            ps = g_object_class_find_property(G_OBJECT_GET_CLASS(fx_src), "client-name");
+            if (ps) {
                 g_object_set(fx_src, "client-name", "Effects In", NULL);
             }
-            ps2 = g_object_class_find_property(G_OBJECT_GET_CLASS(fx_src), "provide-clock");
-            if (ps2) {
-                g_object_set(fx_src, "provide-clock", FALSE, NULL);
-            }
-            ps2 = g_object_class_find_property(G_OBJECT_GET_CLASS(fx_src), "buffer-time");
-            if (ps2) {
-                g_object_set(fx_src, "buffer-time", (gint64)200000, NULL);
-            }
 
-            g_object_set(fx_queue,
-                "max-size-buffers", 200,
-                "leaky", 2,
-                NULL);
+            g_object_set(fx_file_sink, "location", "webcam_effects.mp3", NULL);
 
-            g_object_set(fx_file_sink,
-                "location", "webcam_effects.mp3",
-                "async", FALSE,
-                NULL);
+            // Add elements to effects pipeline
+            gst_bin_add_many(GST_BIN(g_fx_pipeline), fx_src, fx_convert,
+                             fx_resample, fx_encoder, fx_file_sink, NULL);
 
-            gst_bin_add_many(GST_BIN(g_pipeline), fx_src, fx_convert,
-                             fx_resample, fx_queue, fx_encoder, fx_file_sink, NULL);
-
-            if (!gst_element_link_many(fx_src, fx_convert, fx_resample,
-                                      fx_queue, fx_encoder, fx_file_sink, NULL)) {
-                g_printerr("Failed to link effects audio pipeline. Effects audio disabled.\n");
+            // Link effects pipeline
+            if (gst_element_link_many(fx_src, fx_convert, fx_resample,
+                                      fx_encoder, fx_file_sink, NULL)) {
+                // Start effects pipeline independently (async is OK for live sources)
+                GstStateChangeReturn ret = gst_element_set_state(g_fx_pipeline, GST_STATE_PLAYING);
+                if (ret == GST_STATE_CHANGE_FAILURE) {
+                    g_printerr("Failed to start effects audio pipeline.\n");
+                    gst_object_unref(g_fx_pipeline);
+                    g_fx_pipeline = NULL;
+                } else {
+                    g_print("Effects audio pipeline started (patch via qpwgraph).\n");
+                }
             } else {
-                g_print("Effects audio input exposed (patch via qpwgraph).\n");
+                g_printerr("Failed to link effects audio pipeline.\n");
+                gst_object_unref(g_fx_pipeline);
+                g_fx_pipeline = NULL;
             }
+        } else {
+            g_printerr("Failed to create effects audio elements.\n");
         }
+    }
+
+    if (!g_fx_pipeline) {
+        g_printerr("No fx pipeline available;\n");
     }
 }
