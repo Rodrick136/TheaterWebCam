@@ -1,0 +1,18 @@
+{
+  "name": "web-cam",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "compile": "gcc -shared -fPIC ./compile/intercom.c $(pkg-config --cflags --libs gstreamer-1.0) -o ./compile/libintercom.so"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.9.3"
+  },
+  "trustedDependencies": [
+    "@fresh-editor/fresh-editor"
+  ]
+}
