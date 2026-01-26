@@ -60,6 +60,7 @@ char *start_cam(char *device_path, int should_record, char *video_size)
 {
     GstElement *source, *convert, *tee, *display_queue, *record_queue;
     GstElement *display_sink, *encoder, *video_muxer, *video_file_sink;
+    GstElement *capsfilter; // NEW: capsfilter for width/height negotiation
     GstBus *bus;
     GstPad *tee_display_pad, *tee_record_pad;
     GstPad *queue_display_pad, *queue_record_pad;
@@ -72,12 +73,13 @@ char *start_cam(char *device_path, int should_record, char *video_size)
 
     // Create common elements
     source = gst_element_factory_make("v4l2src", "source");
+    capsfilter = gst_element_factory_make("capsfilter", "capsfilter"); // NEW
     convert = gst_element_factory_make("videoconvert", "convert");
     tee = gst_element_factory_make("tee", "tee");
     display_queue = gst_element_factory_make("queue", "display_queue");
     display_sink = gst_element_factory_make("autovideosink", "display_sink");
 
-    if (!g_pipeline || !source || !convert || !tee || !display_queue || !display_sink) {
+    if (!g_pipeline || !source || !capsfilter || !convert || !tee || !display_queue || !display_sink) {
         g_printerr("Failed to create basic pipeline elements.\n");
         return "Failed to create GStreamer elements";
     }
@@ -88,18 +90,19 @@ char *start_cam(char *device_path, int should_record, char *video_size)
         "do-timestamp", TRUE,    // Use pipeline clock for timestamps
         NULL);
 
-    // Parse and set video size
+    // Parse and set video size via capsfilter (not on v4l2src)
     int width, height;
     if (sscanf(video_size, "%dx%d", &width, &height) == 2) {
         GstCaps *caps = gst_caps_new_simple("video/x-raw",
             "width", G_TYPE_INT, width,
             "height", G_TYPE_INT, height,
             NULL);
-        g_object_set(source, "caps", caps, NULL);
+        g_object_set(capsfilter, "caps", caps, NULL);
         gst_caps_unref(caps);
         g_print("Video size set to: %dx%d\n", width, height);
     } else {
         g_printerr("Invalid video size format: %s\n", video_size);
+        return "Invalid video size format. Expected \\d+x\\d+.";
     }
 
     // Configure tee to not block if one branch is slower
@@ -115,11 +118,11 @@ char *start_cam(char *device_path, int should_record, char *video_size)
         NULL);
 
     // Add basic elements to pipeline
-    gst_bin_add_many(GST_BIN(g_pipeline), source, convert, tee, display_queue, display_sink, NULL);
+    gst_bin_add_many(GST_BIN(g_pipeline), source, capsfilter, convert, tee, display_queue, display_sink, NULL);
 
-    // Link: source -> convert -> tee
-    if (!gst_element_link_many(source, convert, tee, NULL)) {
-        g_printerr("Failed to link source -> convert -> tee.\n");
+    // Link: source -> capsfilter -> convert -> tee
+    if (!gst_element_link_many(source, capsfilter, convert, tee, NULL)) {
+        g_printerr("Failed to link source -> capsfilter -> convert -> tee.\n");
         gst_object_unref(g_pipeline);
         return "Failed to link GStreamer elements";
     }
