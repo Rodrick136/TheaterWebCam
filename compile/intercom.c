@@ -5,6 +5,11 @@
 static GstElement *g_pipeline = NULL;
 static GMainLoop *g_main_loop = NULL;
 
+static gboolean is_display_window_closed(const GError *err)
+{
+    return err && err->message && g_strrstr(err->message, "window was closed") != NULL;
+}
+
 static void signal_handler(int signum)
 {
     g_print("Received signal %d, cleaning up...\n", signum);
@@ -21,15 +26,23 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer data)
             GError *err;
             gchar *debug;
             gst_message_parse_error(message, &err, &debug);
-            g_printerr("Error: %s\n", err->message);
+            if (is_display_window_closed(err)) {
+                g_print("Display window closed, stopping...\n");
+            } else {
+                g_printerr("Error: %s\n", err->message);
+            }
             g_error_free(err);
             g_free(debug);
-            g_main_loop_quit(g_main_loop);
+            if (g_main_loop) {
+                g_main_loop_quit(g_main_loop);
+            }
             break;
         }
         case GST_MESSAGE_EOS:
             g_print("End of stream\n");
-            g_main_loop_quit(g_main_loop);
+            if (g_main_loop) {
+                g_main_loop_quit(g_main_loop);
+            }
             break;
         default:
             break;
@@ -39,7 +52,8 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer data)
 
 // device_path takes the form of /dev/video0
 // should_record is 1 to enable recording, 0 to disable
-char *start_cam(char *device_path, int should_record)
+// video_size of the device to be set, passes /^\d+x\d+$/
+char *start_cam(char *device_path, int should_record, char *video_size)
 {
     GstElement *source, *convert, *tee, *display_queue, *record_queue;
     GstElement *display_sink, *encoder, *video_muxer, *video_file_sink;
@@ -71,6 +85,20 @@ char *start_cam(char *device_path, int should_record)
         "device", device_path,
         "do-timestamp", TRUE,    // Use pipeline clock for timestamps
         NULL);
+
+    // Parse and set video size
+    int width, height;
+    if (sscanf(video_size, "%dx%d", &width, &height) == 2) {
+        GstCaps *caps = gst_caps_new_simple("video/x-raw",
+            "width", G_TYPE_INT, width,
+            "height", G_TYPE_INT, height,
+            NULL);
+        g_object_set(source, "caps", caps, NULL);
+        gst_caps_unref(caps);
+        g_print("Video size set to: %dx%d\n", width, height);
+    } else {
+        g_printerr("Invalid video size format: %s\n", video_size);
+    }
 
     // Configure tee to not block if one branch is slower
     g_object_set(tee,
