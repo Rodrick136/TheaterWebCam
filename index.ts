@@ -7,7 +7,7 @@ const { values, positionals } = parseArgs({
   options: {
     record: {
       type: "boolean",
-      short: 'r',
+      short: "r",
     },
   },
   strict: true,
@@ -23,7 +23,7 @@ if (RECORD) {
 const DEVICE = (
   await Bun.$`v4l2-ctl --list-devices | grep "Logitech BRIO" -A 1 | tail -n 1 | xargs`.text()
 ).trim();
-console.log(`Selected device: ${DEVICE}`);
+console.log(`Selected cam device: ${DEVICE}`);
 
 Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=auto_exposure=1`;
 Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=exposure_time_absolute=400`;
