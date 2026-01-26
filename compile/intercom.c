@@ -200,12 +200,6 @@ static char *setup_display_branch(GstElement *tee, GstElement *display_queue, Gs
         "leaky", 2,                  // Drop oldest buffers when downstream is late
         NULL);
 
-    // Display ASAP without clock sync to minimize latency
-    g_object_set(display_sink,
-        "sync", FALSE,
-        "async", FALSE,      // Don't wait for preroll, prevents blocking when recording
-        NULL);
-
     // Link display branch: tee -> display_queue -> display_sink
     tee_display_pad = gst_element_request_pad_simple(tee, "src_%u");
     queue_display_pad = gst_element_get_static_pad(display_queue, "sink");
