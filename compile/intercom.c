@@ -42,12 +42,11 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer data)
 char *start_cam(char *device_path, int should_record)
 {
     GstElement *source, *convert, *tee, *display_queue, *record_queue;
-    GstElement *display_sink, *encoder, *muxer, *file_sink;
-    GstElement *audio_src, *audio_convert, *audio_resample, *audio_queue, *audio_encoder;
+    GstElement *display_sink, *encoder, *video_muxer, *video_file_sink;
+    GstElement *audio_src, *audio_convert, *audio_resample, *audio_queue, *audio_encoder, *audio_file_sink;
     GstBus *bus;
     GstPad *tee_display_pad, *tee_record_pad;
     GstPad *queue_display_pad, *queue_record_pad;
-    GstPad *video_pad, *audio_pad;
 
     // Initialize GStreamer
     gst_init(NULL, NULL);
@@ -68,7 +67,6 @@ char *start_cam(char *device_path, int should_record)
     }
 
     // Set the device property on the source
-    // Enable timestamping using pipeline clock for A/V sync
     g_object_set(source,
         "device", device_path,
         "do-timestamp", TRUE,    // Use pipeline clock for timestamps
@@ -112,82 +110,46 @@ char *start_cam(char *device_path, int should_record)
         return "Failed to link display sink";
     }
 
-    // If recording is enabled, add recording branch
+    // If recording is enabled, add separate video and audio recording
     if (should_record) {
-        g_print("Recording enabled - output will be saved to webcam_recording.mp4\n");
+        g_print("Recording enabled - video: webcam_video.mp4, audio: webcam_audio.mp3\n");
 
+        // Create video recording elements
         record_queue = gst_element_factory_make("queue", "record_queue");
         encoder = gst_element_factory_make("x264enc", "encoder");
-        muxer = gst_element_factory_make("mp4mux", "muxer");
-        file_sink = gst_element_factory_make("filesink", "file_sink");
+        video_muxer = gst_element_factory_make("mp4mux", "video_muxer");
+        video_file_sink = gst_element_factory_make("filesink", "video_file_sink");
 
-        if (!record_queue) {
-            g_printerr("Failed to create record_queue element.\n");
+        if (!record_queue || !encoder || !video_muxer || !video_file_sink) {
+            g_printerr("Failed to create video recording elements.\n");
             gst_object_unref(g_pipeline);
-            return "Failed to create record_queue";
-        }
-        if (!encoder) {
-            g_printerr("Failed to create x264enc encoder. Install gstreamer1-plugins-ugly or gst-plugins-ugly.\n");
-            gst_object_unref(g_pipeline);
-            return "Failed to create x264enc encoder";
-        }
-        if (!muxer) {
-            g_printerr("Failed to create mp4mux muxer. Install gstreamer1-plugins-good or gst-plugins-good.\n");
-            gst_object_unref(g_pipeline);
-            return "Failed to create mp4mux muxer";
-        }
-        if (!file_sink) {
-            g_printerr("Failed to create filesink element.\n");
-            gst_object_unref(g_pipeline);
-            return "Failed to create filesink";
+            return "Failed to create video recording elements";
         }
 
-        // Configure recording queue to be large and non-blocking
-        // Leaky=2 means drop old frames if queue fills up, preventing blocking
+        // Configure recording queue - leaky to prevent blocking
         g_object_set(record_queue,
-            "max-size-buffers", 200,    // Large buffer (200 frames ~6-7 seconds at 30fps)
-            "max-size-bytes", 0,        // Disable byte limit
-            "max-size-time", 0,         // Disable time limit
-            "leaky", 2,                 // Drop oldest frames if queue is full (don't block)
+            "max-size-buffers", 200,
+            "max-size-bytes", 0,
+            "max-size-time", 0,
+            "leaky", 2,
             NULL);
 
-        // Configure encoder for quality over speed (no zerolatency)
-        // Medium speed preset balances quality and encoding time
+        // Configure encoder
         g_object_set(encoder,
             "speed-preset", 6,          // Medium preset (0=ultrafast, 10=veryslow)
             "bitrate", 2048,            // 2 Mbps for good quality
             NULL);
 
-        // Configure filesink
-        g_object_set(file_sink,
-            "location", "webcam_recording.mp4",
-            "async", FALSE,    // Don't preroll async, ensures proper file finalization
+        // Configure video filesink
+        g_object_set(video_file_sink,
+            "location", "webcam_video.mp4",
+            "async", FALSE,
             NULL);
 
-        // Create audio elements
-        audio_src = gst_element_factory_make("pulsesrc", "audio_src");
-        audio_convert = gst_element_factory_make("audioconvert", "audio_convert");
-        audio_resample = gst_element_factory_make("audioresample", "audio_resample");
-        audio_queue = gst_element_factory_make("queue", "audio_queue");
-        audio_encoder = gst_element_factory_make("lamemp3enc", "audio_encoder");
+        // Add video recording elements to pipeline
+        gst_bin_add_many(GST_BIN(g_pipeline), record_queue, encoder, video_muxer, video_file_sink, NULL);
 
-        if (!audio_src || !audio_convert || !audio_resample || !audio_queue || !audio_encoder) {
-            g_printerr("Failed to create audio elements. Audio will be disabled.\n");
-            // Continue without audio
-            audio_src = NULL;
-        } else {
-            // Configure audio source for proper A/V sync
-            g_object_set(audio_src,
-                "do-timestamp", TRUE,           // Use pipeline clock for timestamps
-                "provide-clock", FALSE,         // Don't provide a clock, use pipeline clock
-                "buffer-time", (gint64)200000,  // 200ms buffer
-                NULL);
-        }
-
-        // Add recording elements to pipeline
-        gst_bin_add_many(GST_BIN(g_pipeline), record_queue, encoder, muxer, file_sink, NULL);
-
-        // Link video branch: tee -> record_queue -> encoder
+        // Link video recording: tee -> record_queue -> encoder -> video_muxer -> video_file_sink
         tee_record_pad = gst_element_request_pad_simple(tee, "src_%u");
         queue_record_pad = gst_element_get_static_pad(record_queue, "sink");
         if (gst_pad_link(tee_record_pad, queue_record_pad) != GST_PAD_LINK_OK) {
@@ -197,25 +159,30 @@ char *start_cam(char *device_path, int should_record)
         }
         gst_object_unref(queue_record_pad);
 
-        if (!gst_element_link_many(record_queue, encoder, NULL)) {
-            g_printerr("Failed to link video recording elements.\n");
+        if (!gst_element_link_many(record_queue, encoder, video_muxer, video_file_sink, NULL)) {
+            g_printerr("Failed to link video recording pipeline.\n");
             gst_object_unref(g_pipeline);
-            return "Failed to link video pipeline";
+            return "Failed to link video recording pipeline";
         }
 
-        // Link encoder to muxer video pad
-        video_pad = gst_element_request_pad_simple(muxer, "video_%u");
-        GstPad *encoder_src_pad = gst_element_get_static_pad(encoder, "src");
-        if (gst_pad_link(encoder_src_pad, video_pad) != GST_PAD_LINK_OK) {
-            g_printerr("Failed to link video encoder to muxer.\n");
-            gst_object_unref(g_pipeline);
-            return "Failed to link video to muxer";
-        }
-        gst_object_unref(encoder_src_pad);
+        // Create audio elements
+        audio_src = gst_element_factory_make("pulsesrc", "audio_src");
+        audio_convert = gst_element_factory_make("audioconvert", "audio_convert");
+        audio_resample = gst_element_factory_make("audioresample", "audio_resample");
+        audio_queue = gst_element_factory_make("queue", "audio_queue");
+        audio_encoder = gst_element_factory_make("lamemp3enc", "audio_encoder");
+        audio_file_sink = gst_element_factory_make("filesink", "audio_file_sink");
 
-        // Add and link audio branch if available
-        if (audio_src) {
-            g_print("Audio recording enabled (default input device)\n");
+        if (!audio_src || !audio_convert || !audio_resample || !audio_queue || !audio_encoder || !audio_file_sink) {
+            g_printerr("Failed to create audio elements. Audio will be disabled.\n");
+            audio_src = NULL;
+        } else {
+            // Configure audio source
+            g_object_set(audio_src,
+                "do-timestamp", TRUE,
+                "provide-clock", FALSE,
+                "buffer-time", (gint64)200000,
+                NULL);
 
             // Configure audio queue
             g_object_set(audio_queue,
@@ -223,32 +190,25 @@ char *start_cam(char *device_path, int should_record)
                 "leaky", 2,
                 NULL);
 
+            // Configure audio filesink
+            g_object_set(audio_file_sink,
+                "location", "webcam_audio.mp3",
+                "async", FALSE,
+                NULL);
+
+            // Add audio elements to pipeline
             gst_bin_add_many(GST_BIN(g_pipeline), audio_src, audio_convert,
-                           audio_resample, audio_queue, audio_encoder, NULL);
+                           audio_resample, audio_queue, audio_encoder, audio_file_sink, NULL);
 
+            // Link audio recording: audio_src -> audio_convert -> audio_resample -> audio_queue -> audio_encoder -> audio_file_sink
             if (!gst_element_link_many(audio_src, audio_convert, audio_resample,
-                                      audio_queue, audio_encoder, NULL)) {
-                g_printerr("Failed to link audio elements.\n");
+                                      audio_queue, audio_encoder, audio_file_sink, NULL)) {
+                g_printerr("Failed to link audio recording pipeline.\n");
                 gst_object_unref(g_pipeline);
-                return "Failed to link audio pipeline";
+                return "Failed to link audio recording pipeline";
             }
 
-            // Link audio encoder to muxer audio pad
-            audio_pad = gst_element_request_pad_simple(muxer, "audio_%u");
-            GstPad *audio_encoder_src_pad = gst_element_get_static_pad(audio_encoder, "src");
-            if (gst_pad_link(audio_encoder_src_pad, audio_pad) != GST_PAD_LINK_OK) {
-                g_printerr("Failed to link audio encoder to muxer.\n");
-                gst_object_unref(g_pipeline);
-                return "Failed to link audio to muxer";
-            }
-            gst_object_unref(audio_encoder_src_pad);
-        }
-
-        // Link muxer to file sink
-        if (!gst_element_link(muxer, file_sink)) {
-            g_printerr("Failed to link muxer to file sink.\n");
-            gst_object_unref(g_pipeline);
-            return "Failed to link muxer to file";
+            g_print("Audio recording enabled (default input device)\n");
         }
     }
 
@@ -277,7 +237,7 @@ char *start_cam(char *device_path, int should_record)
     // Cleanup - send EOS to properly finalize recording
     g_print("Cleaning up GStreamer pipeline...\n");
 
-    // Send end-of-stream event to finalize MP4 file
+    // Send end-of-stream event to finalize files
     gst_element_send_event(g_pipeline, gst_event_new_eos());
 
     // Wait a bit for EOS to be processed
