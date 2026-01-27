@@ -8,6 +8,10 @@ static GstElement *g_pipeline = NULL;
 static GstElement *g_voice_pipeline = NULL; // Separate pipeline for voice audio
 static GstElement *g_fx_pipeline = NULL;    // Separate pipeline for effects audio
 
+// Global variable to track the last sync marker timestamp
+static GstClockTime g_last_sync_marker = GST_CLOCK_TIME_NONE;
+static GMutex g_sync_marker_mutex; // Mutex for thread-safe access to sync marker
+
 // Forward declarations
 static void configure_audio_pipeline(const char *name, const char *client_name, const char *output_file, GstElement **pipeline_ptr);
 static char *setup_display_branch(GstElement *tee, GstElement *display_queue, GstElement *display_sink);
@@ -186,6 +190,9 @@ char *start_cam(char *device_path, int should_record, char *video_size)
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
+    // Initialize mutex for sync marker
+    g_mutex_init(&g_sync_marker_mutex);
+
     // Create and run the main loop
     g_main_loop = g_main_loop_new(NULL, FALSE);
     g_print("Running webcam stream. Press Ctrl+C to stop.\n");
@@ -193,6 +200,9 @@ char *start_cam(char *device_path, int should_record, char *video_size)
 
     // Cleanup - send EOS to properly finalize recording
     g_print("Cleaning up GStreamer pipelines...\n");
+
+    // Destroy the mutex during cleanup
+    g_mutex_clear(&g_sync_marker_mutex);
 
     // Send end-of-stream event to video pipeline to finalize files
     gst_element_send_event(g_pipeline, gst_event_new_eos());
