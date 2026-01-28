@@ -19,29 +19,59 @@ static void configure_audio_pipeline(const char *name, const char *client_name, 
 static char *setup_display_branch(GstElement *tee, GstElement *display_queue, GstElement *display_sink);
 static char *setup_recording_branch(GstElement *tee);
 
-static WINDOW *log_window;
+static WINDOW *log_pad;
+static int log_pad_height = 1000; // Initial height of the pad
+static int log_pad_width;
+static int log_pad_current_line = 0; // Tracks the current line for writing logs
 
-static void setup_log_window()
+static void setup_log_pad()
 {
-    int height = LINES - 5; // Leave space for other UI elements
-    int width = COLS;
-    int start_y = 0;
-    int start_x = 0;
+    log_pad_width = COLS; // Use the full width of the terminal
+    log_pad_height = LINES; // Use the full height of the terminal
+    log_pad = newpad(log_pad_height, log_pad_width);
+    if (!log_pad)
+    {
+        fprintf(stderr, "Failed to create log pad\n");
+        exit(1);
+    }
+    scrollok(log_pad, TRUE); // Enable scrolling
 
-    log_window = newwin(height, width, start_y, start_x);
-    scrollok(log_window, TRUE); // Enable scrolling
+    // Ensure the log_pad is always visible by refreshing the entire screen
+    prefresh(log_pad, 0, 0, 0, 0, LINES - 1, COLS - 1);
+}
+
+static void write_to_log_pad(const char *prefix, const char *format, va_list args)
+{
+    if (log_pad)
+    {
+        char message[1024];
+        vsnprintf(message, sizeof(message), format, args);
+
+        // Write to the pad with prefix
+        mvwprintw(log_pad, log_pad_current_line++, 0, "%s%s", prefix, message);
+        if (log_pad_current_line >= log_pad_height)
+        {
+            log_pad_height *= 2; // Double the pad height if we exceed it
+            wresize(log_pad, log_pad_height, log_pad_width);
+        }
+
+        // Refresh the visible portion of the pad
+        prefresh(log_pad, log_pad_current_line - LINES + 5, 0, 0, 0, LINES - 1, COLS - 1);
+    }
+    else
+    {
+        // Fallback to standard output if log_pad is not initialized
+        fprintf(stdout, "%s", prefix);
+        vfprintf(stdout, format, args);
+        fprintf(stdout, "\n");
+    }
 }
 
 static void print_log(const char *format, ...)
 {
     va_list args;
     va_start(args, format);
-
-    // Prefix the message with [LOG]
-    wprintw(log_window, "[LOG] ");
-    vw_printw(log_window, format, args);
-    wrefresh(log_window); // Refresh the log window to display the message
-
+    write_to_log_pad("[LOG] ", format, args);
     va_end(args);
 }
 
@@ -49,25 +79,16 @@ static void print_warning(const char *format, ...)
 {
     va_list args;
     va_start(args, format);
-
-    // Prefix the message with [WARNING]
-    wprintw(log_window, "[WARNING] ");
-    vw_printw(log_window, format, args);
-    wrefresh(log_window); // Refresh the log window to display the message
-
+    write_to_log_pad("[WARNING] ", format, args);
     va_end(args);
 }
 
 static void print_error(const char *format, ...)
 {
+
     va_list args;
     va_start(args, format);
-
-    // Prefix the message with [ERROR]
-    wprintw(log_window, "[ERROR] ");
-    vw_printw(log_window, format, args);
-    wrefresh(log_window); // Refresh the log window to display the message
-
+    write_to_log_pad("[ERROR] ", format, args);
     va_end(args);
 }
 
@@ -81,43 +102,64 @@ static void *ncurses_event_listener(void *arg)
         {
             switch (ch)
             {
-            case KEY_UP:
-                print_log("Key pressed: UP\n");
+            case 'm':
+                print_log("[KEY] m (make markers)\n");
                 break;
             case 'q':
-                print_log("Key pressed: q (quit)\n");
-
+                print_log("[KEY] q (quit)\n");
+                raise(SIGTERM); // Send SIGTERM to exit the main loop
+                pthread_exit(NULL);
+            case 3: // ASCII value for Ctrl+C
+                print_log("[KEY] Ctrl+C (quit)\n");
                 raise(SIGTERM); // Send SIGTERM to exit the main loop
                 pthread_exit(NULL);
             default:
-                print_log("Key pressed: %c\n", ch);
+                // print_log("Key pressed: %c\n", ch);
+                //  Do nothing for other keys
                 break;
             }
         }
-        g_usleep(10000); // Sleep for 10ms to reduce CPU usage
+        g_usleep(100000); // Sleep for 100ms to reduce CPU usage
     }
     return NULL;
 }
 
+static void handle_resize(int sig)
+{
+    endwin(); // End ncurses mode to reset terminal dimensions
+    refresh(); // Refresh ncurses to apply new dimensions
+
+    log_pad_width = COLS; // Update log_pad dimensions to match new terminal size
+    log_pad_height = LINES;
+    wresize(log_pad, log_pad_height, log_pad_width); // Resize the pad
+
+    // Ensure the log_pad is always visible by refreshing the entire screen
+    prefresh(log_pad, 0, 0, 0, 0, LINES - 1, COLS - 1);
+}
+
 static char *setup_ncurses()
 {
+    // Disable default SIGINT handling to allow Ctrl+C to be captured as a key press
+    // signal(SIGINT, SIG_IGN);
+
     // Initialize ncurses
     initscr();
-    cbreak();
+    raw(); // Use raw mode to capture all key presses, including Ctrl+C
     noecho();
     curs_set(1);           // Show the cursor
     nodelay(stdscr, TRUE); // Non-blocking input
     keypad(stdscr, TRUE);
 
-    setup_log_window();
+    setup_log_pad();
+
+    // Set up a signal handler for window resize events
+    signal(SIGWINCH, handle_resize);
 
     // Start a thread to listen for terminal events
     pthread_t ncurses_thread;
     if (pthread_create(&ncurses_thread, NULL, ncurses_event_listener, NULL) != 0)
     {
-        g_printerr("Error: Failed to create ncurses event listener thread.\n");
-        endwin();
-        return "Failed to create ncurses thread";
+        print_error("Error: Failed to create ncurses event listener thread.\n");
     }
 
     return NULL;
@@ -130,9 +172,8 @@ static gboolean is_display_window_closed(const GError *err)
 
 static void signal_handler(int signum)
 {
-    g_print("\nReceived signal %d, cleaning up...\n", signum);
-
-    endwin(); // ncurses - Restore terminal to normal state
+    const char *signal_name = strsignal(signum);
+    print_log("Received signal %d (%s), cleaning up...\n", signum, signal_name ? signal_name : "Unknown");
 
     if (g_main_loop)
     {
@@ -151,11 +192,11 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer data)
         gst_message_parse_error(message, &err, &debug);
         if (is_display_window_closed(err))
         {
-            g_print("Display window closed, stopping...\n");
+            print_log("Display window closed, stopping...\n");
         }
         else
         {
-            g_printerr("Error: %s\n", err->message);
+            print_error("Error: %s\n", err->message);
         }
         g_error_free(err);
         g_free(debug);
@@ -163,7 +204,7 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer data)
         break;
     }
     case GST_MESSAGE_EOS:
-        g_print("End of stream\n");
+        print_log("End of stream\n");
         if (g_main_loop)
         {
             g_main_loop_quit(g_main_loop);
@@ -187,7 +228,7 @@ char *start_cam(char *device_path, int should_record, char *video_size)
         error = setup_ncurses();
         if (error != NULL)
         {
-            g_print("Warning: Failed to setup ncurses: %s\n", error);
+            print_warning("Warning: Failed to setup ncurses: %s\n", error);
             return error;
         }
     }
@@ -212,13 +253,13 @@ char *start_cam(char *device_path, int should_record, char *video_size)
     decoder = gst_element_factory_make("jpegdec", "decoder");
     if (!decoder)
     {
-        g_printerr("Failed to create jpegdec. Is gst-plugins-good installed?\n");
+        print_error("Failed to create jpegdec. Is gst-plugins-good installed?\n");
         return "Missing jpegdec GStreamer plugin";
     }
 
     if (!g_pipeline || !source || !capsfilter || !convert || !tee || !display_queue || !display_sink)
     {
-        g_printerr("Failed to create basic pipeline elements.\n");
+        print_error("Failed to create basic pipeline elements.\n");
         return "Failed to create GStreamer elements";
     }
 
@@ -245,11 +286,11 @@ char *start_cam(char *device_path, int should_record, char *video_size)
                                             NULL);
         g_object_set(capsfilter, "caps", caps, NULL);
         gst_caps_unref(caps);
-        g_print("Video size set to: %dx%d\n", width, height);
+        print_log("Video size set to: %dx%d\n", width, height);
     }
     else
     {
-        g_printerr("Invalid video size format: %s\n", video_size);
+        print_error("Invalid video size format: %s\n", video_size);
         return "Invalid video size format. Expected \\d+x\\d+.";
     }
 
@@ -264,7 +305,7 @@ char *start_cam(char *device_path, int should_record, char *video_size)
     // Link: source -> capsfilter -> decoder -> convert -> tee
     if (!gst_element_link_many(source, capsfilter, decoder, convert, tee, NULL))
     {
-        g_printerr("Failed to link source -> capsfilter -> decoder -> convert -> tee.\n");
+        print_error("Failed to link source -> capsfilter -> decoder -> convert -> tee.\n");
         gst_object_unref(g_pipeline);
         return "Failed to link GStreamer elements";
     }
@@ -297,13 +338,12 @@ char *start_cam(char *device_path, int should_record, char *video_size)
     GstStateChangeReturn ret = gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE)
     {
-        g_printerr("Unable to set the pipeline to the playing state.\n");
+        print_error("Unable to set the pipeline to the playing state.\n");
         gst_object_unref(g_pipeline);
         return "Failed to start pipeline";
     }
 
     // Setup signal handlers for cleanup
-    signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
     // Initialize mutex for sync marker
@@ -311,11 +351,11 @@ char *start_cam(char *device_path, int should_record, char *video_size)
 
     // Create and run the main loop
     g_main_loop = g_main_loop_new(NULL, FALSE);
-    g_print("Running webcam stream. Press Ctrl+C to stop.\n");
+    print_log("Running webcam stream. Press q or Ctrl+C to stop.\n");
     g_main_loop_run(g_main_loop);
 
     // Start Cleanup
-    g_print("Cleaning up...\n");
+    print_log("Cleaning up...\n");
 
     // Destroy the mutex during cleanup
     g_mutex_clear(&g_sync_marker_mutex);
@@ -373,6 +413,37 @@ char *start_cam(char *device_path, int should_record, char *video_size)
 
     g_main_loop_unref(g_main_loop);
 
+    // Store all logs from the pad into a buffer before ending ncurses
+    if (log_pad)
+    {
+        int height, width;
+        getmaxyx(log_pad, height, width);
+
+        char **buffer = malloc(log_pad_current_line * sizeof(char *));
+        for (int i = 0; i < log_pad_current_line; i++)
+        {
+            buffer[i] = malloc((width + 1) * sizeof(char)); // +1 for null terminator
+            memset(buffer[i], 0, width + 1);
+            mvwinnstr(log_pad, i, 0, buffer[i], width);
+        }
+
+        delwin(log_pad);
+        log_pad = NULL;
+        endwin();
+
+        // Print the buffered lines to stdout
+        for (int i = 0; i < log_pad_current_line; i++)
+        {
+            printf("%s\n", buffer[i]);
+            free(buffer[i]); // Free each line after printing
+        }
+        free(buffer); // Free the buffer array
+    }
+    else
+    {
+        endwin();
+    }
+
     return NULL;
 }
 
@@ -398,7 +469,7 @@ static char *setup_display_branch(GstElement *tee, GstElement *display_queue, Gs
     queue_display_pad = gst_element_get_static_pad(display_queue, "sink");
     if (gst_pad_link(tee_display_pad, queue_display_pad) != GST_PAD_LINK_OK)
     {
-        g_printerr("Failed to link tee to display queue.\n");
+        print_error("Failed to link tee to display queue.\n");
         gst_object_unref(queue_display_pad);
         return "Failed to link display branch";
     }
@@ -406,7 +477,7 @@ static char *setup_display_branch(GstElement *tee, GstElement *display_queue, Gs
 
     if (!gst_element_link(display_queue, display_sink))
     {
-        g_printerr("Failed to link display queue to sink.\n");
+        print_error("Failed to link display queue to sink.\n");
         return "Failed to link display sink";
     }
 
@@ -418,7 +489,7 @@ static char *setup_recording_branch(GstElement *tee)
     GstElement *record_queue, *encoder, *muxer_queue, *video_muxer, *video_file_sink;
     GstPad *tee_record_pad, *queue_record_pad;
 
-    g_print("Recording enabled - video: webcam_video.mp4\n");
+    print_log("Recording enabled - video: webcam_video.mp4\n");
 
     // Create video recording elements
     record_queue = gst_element_factory_make("queue", "record_queue");
@@ -429,7 +500,7 @@ static char *setup_recording_branch(GstElement *tee)
 
     if (!record_queue || !encoder || !muxer_queue || !video_muxer || !video_file_sink)
     {
-        g_printerr("Failed to create video recording elements.\n");
+        print_error("Failed to create video recording elements.\n");
         return "Failed to create video recording elements";
     }
 
@@ -500,7 +571,7 @@ static char *setup_recording_branch(GstElement *tee)
     queue_record_pad = gst_element_get_static_pad(record_queue, "sink");
     if (gst_pad_link(tee_record_pad, queue_record_pad) != GST_PAD_LINK_OK)
     {
-        g_printerr("Failed to link tee to record queue.\n");
+        print_error("Failed to link tee to record queue.\n");
         gst_object_unref(queue_record_pad);
         return "Failed to link record branch";
     }
@@ -508,7 +579,7 @@ static char *setup_recording_branch(GstElement *tee)
 
     if (!gst_element_link_many(record_queue, encoder, muxer_queue, video_muxer, video_file_sink, NULL))
     {
-        g_printerr("Failed to link video recording pipeline.\n");
+        print_error("Failed to link video recording pipeline.\n");
         return "Failed to link video recording pipeline";
     }
 
@@ -545,7 +616,7 @@ static void configure_audio_pipeline(
 
     if (!src || !src_queue || !convert || !resample || !encoder || !file_sink)
     {
-        g_printerr("Failed to create %s audio elements.\n", name);
+        print_error("Failed to create %s audio elements.\n", name);
         return;
     }
 
@@ -582,17 +653,17 @@ static void configure_audio_pipeline(
     if (!gst_element_link_many(src, src_queue, convert, resample,
                                encoder, file_sink, NULL))
     {
-        g_printerr("Failed to link %s audio pipeline.\n", name);
+        print_error("Failed to link %s audio pipeline.\n", name);
         gst_object_unref(*pipeline_ptr);
         *pipeline_ptr = NULL;
         return;
     }
 
-    g_print("[%s Audio] Pipeline created successfully\n", name);
+    print_log("[%s Audio] Pipeline created successfully\n", name);
     // Try to configure autoaudiosrc with device and client name properties
     // These need to be set BEFORE the pipeline goes to READY
     // g_object_set(src, "client-name", client_name, NULL);
-    // g_print("[%s Audio] Set client-name property on autoaudiosrc\n", name);
+    // print_log("[%s Audio] Set client-name property on autoaudiosrc\n", name);
     gst_element_set_state(*pipeline_ptr, GST_STATE_READY);
 
     GObject *child = gst_child_proxy_get_child_by_index(GST_CHILD_PROXY(src), 0);
@@ -612,7 +683,7 @@ static void configure_audio_pipeline(
 
             g_object_set(child, "stream-properties", s, NULL);
             gst_structure_free(s);
-            g_print("Successfully set stream-properties for qpwgraph\n");
+            print_log("Successfully set stream-properties for qpwgraph\n");
         }
 
         // Also check for 'client-name' for the server connection
@@ -628,12 +699,12 @@ static void configure_audio_pipeline(
     GstStateChangeReturn ret = gst_element_set_state(*pipeline_ptr, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE)
     {
-        g_printerr("Failed to start %s audio pipeline.\n", name);
+        print_error("Failed to start %s audio pipeline.\n", name);
         gst_object_unref(*pipeline_ptr);
         *pipeline_ptr = NULL;
     }
     else
     {
-        g_print("[%s Audio] Started - recording to %s\n", name, output_file);
+        print_log("[%s Audio] Started - recording to %s\n", name, output_file);
     }
 }
