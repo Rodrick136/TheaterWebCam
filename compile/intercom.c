@@ -6,9 +6,13 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <math.h>
 
 static GMainLoop *g_main_loop = NULL;
+
 static GstElement *g_pipeline = NULL;
+static GstPad *g_recording_src_pad = NULL; // Global variable to store the pad
+
 static GstElement *g_voice_pipeline = NULL; // Separate pipeline for voice audio
 static GstElement *g_fx_pipeline = NULL;    // Separate pipeline for effects audio
 
@@ -242,68 +246,63 @@ static void trigger_sync_markers()
     GstEvent *sync_marker_event = gst_event_new_custom(GST_EVENT_CUSTOM_DOWNSTREAM, gst_structure_new_empty("sync-marker"));
 
     // Insert sync marker into the video pipeline
-    if (g_pipeline)
+    if (g_pipeline && g_recording_src_pad)
     {
-        GstPad *video_sink_pad = gst_element_get_static_pad(g_pipeline, "sink");
-        if (video_sink_pad)
+        if (gst_pad_push_event(g_recording_src_pad, gst_event_ref(sync_marker_event)))
         {
-            if (gst_pad_push_event(video_sink_pad, gst_event_ref(sync_marker_event)))
-            {
-                print_log("Inserted sync marker into video pipeline.\n");
-            }
-            else
-            {
-                print_warning("Failed to insert sync marker into video pipeline.\n");
-            }
-            gst_object_unref(video_sink_pad);
+            print_log("Triggered sync marker event in video pipeline.\n");
         }
         else
         {
-            print_warning("Video pipeline sink pad not found.\n");
+            print_warning("Failed to trigger sync marker event in video pipeline.\n");
         }
+    }
+    else
+    {
+        print_warning("Video pipeline source pad not found.\n");
     }
 
     // Insert sync marker into the voice audio pipeline
     if (g_voice_pipeline)
     {
-        GstPad *voice_sink_pad = gst_element_get_static_pad(g_voice_pipeline, "sink");
-        if (voice_sink_pad)
+        GstPad *voice_src_pad = gst_element_get_static_pad(g_voice_pipeline, "src");
+        if (voice_src_pad)
         {
-            if (gst_pad_push_event(voice_sink_pad, gst_event_ref(sync_marker_event)))
+            if (gst_pad_push_event(voice_src_pad, gst_event_ref(sync_marker_event)))
             {
-                print_log("Inserted sync marker into voice audio pipeline.\n");
+                print_log("Triggered sync marker event in voice audio pipeline.\n");
             }
             else
             {
-                print_warning("Failed to insert sync marker into voice audio pipeline.\n");
+                print_warning("Failed to trigger sync marker event in voice audio pipeline.\n");
             }
-            gst_object_unref(voice_sink_pad);
+            gst_object_unref(voice_src_pad);
         }
         else
         {
-            print_warning("Voice audio pipeline sink pad not found.\n");
+            print_warning("Voice audio pipeline source pad not found.\n");
         }
     }
 
     // Insert sync marker into the effects audio pipeline
     if (g_fx_pipeline)
     {
-        GstPad *fx_sink_pad = gst_element_get_static_pad(g_fx_pipeline, "sink");
-        if (fx_sink_pad)
+        GstPad *fx_src_pad = gst_element_get_static_pad(g_fx_pipeline, "src");
+        if (fx_src_pad)
         {
-            if (gst_pad_push_event(fx_sink_pad, gst_event_ref(sync_marker_event)))
+            if (gst_pad_push_event(fx_src_pad, gst_event_ref(sync_marker_event)))
             {
-                print_log("Inserted sync marker into effects audio pipeline.\n");
+                print_log("Triggered sync marker event in effects audio pipeline.\n");
             }
             else
             {
-                print_warning("Failed to insert sync marker into effects audio pipeline.\n");
+                print_warning("Failed to trigger sync marker event in effects audio pipeline.\n");
             }
-            gst_object_unref(fx_sink_pad);
+            gst_object_unref(fx_src_pad);
         }
         else
         {
-            print_warning("Effects audio pipeline sink pad not found.\n");
+            print_warning("Effects audio pipeline source pad not found.\n");
         }
     }
 
@@ -311,6 +310,71 @@ static void trigger_sync_markers()
     gst_event_unref(sync_marker_event);
 
     g_mutex_unlock(&g_sync_marker_mutex);
+}
+
+static GstPadProbeReturn video_pad_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
+{
+    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM)
+    {
+        GstEvent *event = GST_PAD_PROBE_INFO_EVENT(info);
+        if (GST_EVENT_TYPE(event) == GST_EVENT_CUSTOM_DOWNSTREAM)
+        {
+            const GstStructure *structure = gst_event_get_structure(event);
+            if (gst_structure_has_name(structure, "sync-marker"))
+            {
+                print_log("Sync marker event received on video pipeline.\n");
+
+                // Create an all-white frame
+                GstBuffer *buffer = gst_buffer_new_allocate(NULL, 1920 * 1080 * 3, NULL); // Assuming 1920x1080 RGB
+                GstMapInfo map;
+                gst_buffer_map(buffer, &map, GST_MAP_WRITE);
+                memset(map.data, 0xFF, map.size); // Set all pixels to white
+                gst_buffer_unmap(buffer, &map);
+
+                // Push the buffer downstream
+                gst_pad_push(pad, buffer);
+
+                return GST_PAD_PROBE_DROP; // Drop the event after handling
+            }
+        }
+    }
+    return GST_PAD_PROBE_OK;
+}
+
+static GstPadProbeReturn audio_pad_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
+{
+    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM)
+    {
+        GstEvent *event = GST_PAD_PROBE_INFO_EVENT(info);
+        if (GST_EVENT_TYPE(event) == GST_EVENT_CUSTOM_DOWNSTREAM)
+        {
+            const GstStructure *structure = gst_event_get_structure(event);
+            if (gst_structure_has_name(structure, "sync-marker"))
+            {
+                print_log("Sync marker event received on audio pipeline.\n");
+
+                // Generate a unique tone (e.g., 440 Hz sine wave)
+                GstBuffer *buffer = gst_buffer_new_allocate(NULL, 44100 * 2, NULL); // 1 second of audio at 44.1 kHz, 16-bit
+                GstMapInfo map;
+                gst_buffer_map(buffer, &map, GST_MAP_WRITE);
+
+                guint16 *samples = (guint16 *)map.data;
+                guint num_samples = map.size / sizeof(guint16);
+                for (guint i = 0; i < num_samples; i++)
+                {
+                    samples[i] = (guint16)(32767.0 * sin(2.0 * G_PI * 440.0 * i / 44100.0)); // 440 Hz tone
+                }
+
+                gst_buffer_unmap(buffer, &map);
+
+                // Push the buffer downstream
+                gst_pad_push(pad, buffer);
+
+                return GST_PAD_PROBE_DROP; // Drop the event after handling
+            }
+        }
+    }
+    return GST_PAD_PROBE_OK;
 }
 
 static void *ncurses_event_listener(void *arg)
@@ -484,6 +548,11 @@ char *start_cam(char *device_path, int should_record)
         return "Failed to create GStreamer elements";
     }
 
+    // Attach video probe
+    // GstPad *tee_src_pad = gst_element_request_pad_simple(tee, "src_%u");
+    // gst_pad_add_probe(tee_src_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, video_pad_probe, NULL, NULL);
+    // gst_object_unref(tee_src_pad);
+
     // Set the device property on the source
     g_object_set(source,
                  "device", device_path,
@@ -577,8 +646,18 @@ char *start_cam(char *device_path, int should_record)
     }
     gst_object_unref(cleanup_bus);
 
-    gst_element_set_state(g_pipeline, GST_STATE_NULL);
-    gst_object_unref(g_pipeline);
+    if (g_pipeline)
+    {
+        gst_element_set_state(g_pipeline, GST_STATE_NULL);
+        gst_object_unref(g_pipeline);
+        g_pipeline = NULL; // Avoid dangling pointer
+    }
+
+    if (g_recording_src_pad)
+    {
+        gst_object_unref(g_recording_src_pad);
+        g_recording_src_pad = NULL; // Avoid dangling pointer
+    }
 
     // Cleanup audio pipelines if they exist
     if (g_voice_pipeline)
@@ -595,6 +674,7 @@ char *start_cam(char *device_path, int should_record)
         gst_object_unref(voice_bus);
         gst_element_set_state(g_voice_pipeline, GST_STATE_NULL);
         gst_object_unref(g_voice_pipeline);
+        g_voice_pipeline = NULL; // Avoid dangling pointer
     }
 
     if (g_fx_pipeline)
@@ -611,6 +691,7 @@ char *start_cam(char *device_path, int should_record)
         gst_object_unref(fx_bus);
         gst_element_set_state(g_fx_pipeline, GST_STATE_NULL);
         gst_object_unref(g_fx_pipeline);
+        g_fx_pipeline = NULL; // Avoid dangling pointer
     }
 
     g_main_loop_unref(g_main_loop);
@@ -697,10 +778,10 @@ static char *setup_recording_branch(GstElement *tee)
 
     // Configure encoder for higher quality
     g_object_set(encoder,
-                 "speed-preset", 6,       // Medium preset for better quality
-                 "bitrate", 8192,        // Increase bitrate to ~8 Mbps
-                 "key-int-max", 60,      // Set keyframe interval to 60 frames
-                 "qp-min", 10,           // Minimum quantizer for better quality
+                 "speed-preset", 6, // Medium preset for better quality
+                 "bitrate", 8192,   // Increase bitrate to ~8 Mbps
+                 "key-int-max", 60, // Set keyframe interval to 60 frames
+                 "qp-min", 10,      // Minimum quantizer for better quality
                  NULL);
 
     // Set tune=film for better quality in high-motion scenes
@@ -740,17 +821,47 @@ static char *setup_recording_branch(GstElement *tee)
     // Add video recording elements to pipeline
     gst_bin_add_many(GST_BIN(g_pipeline), record_queue, encoder, muxer_queue, video_muxer, video_file_sink, NULL);
 
-    // Link video recording: tee -> record_queue -> encoder -> muxer_queue -> video_muxer -> video_file_sink
+    // Request a new pad from the tee element
     tee_record_pad = gst_element_request_pad_simple(tee, "src_%u");
+    if (!tee_record_pad)
+    {
+        print_error("Failed to request tee record pad.\n");
+        return "Failed to request tee record pad";
+    }
+
+    {
+        // Request a new pad from the tee element using the valid src_%u template
+        GstPad *tee_pad_probe = gst_element_request_pad_simple(tee, "src_%u");
+        if (!tee_pad_probe || !GST_IS_PAD(tee_pad_probe))
+        {
+            print_error("Failed to create a valid pad from tee using src_%u.\n");
+        }
+
+        // Attach a probe to the requested pad
+        gst_pad_add_probe(tee_pad_probe, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, video_pad_probe, NULL, NULL);
+        g_recording_src_pad = tee_pad_probe;
+    }
+
+    // Get the sink pad of the record queue
     queue_record_pad = gst_element_get_static_pad(record_queue, "sink");
+    if (!queue_record_pad)
+    {
+        print_error("Failed to get record queue sink pad.\n");
+        gst_object_unref(tee_record_pad);
+        return "Failed to get record queue sink pad";
+    }
+
+    // Link the tee pad to the record queue pad
     if (gst_pad_link(tee_record_pad, queue_record_pad) != GST_PAD_LINK_OK)
     {
         print_error("Failed to link tee to record queue.\n");
+        gst_object_unref(tee_record_pad);
         gst_object_unref(queue_record_pad);
         return "Failed to link record branch";
     }
     gst_object_unref(queue_record_pad);
 
+    // Link the remaining elements in the recording branch
     if (!gst_element_link_many(record_queue, encoder, muxer_queue, video_muxer, video_file_sink, NULL))
     {
         print_error("Failed to link video recording pipeline.\n");
@@ -793,6 +904,11 @@ static void configure_audio_pipeline(
         print_error("Failed to create %s audio elements.\n", name);
         return;
     }
+
+    // Attach voice audio probe
+    // GstPad *source_pad = gst_element_request_pad_simple(src, "source_pad");
+    // gst_pad_add_probe(source_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, audio_pad_probe, NULL, NULL);
+    // gst_object_unref(source_pad);
 
     // Configure source queue to buffer audio and prevent blocking
     g_object_set(src_queue,
