@@ -8,17 +8,16 @@ const { values, positionals } = parseArgs({
     record: {
       type: "boolean",
       short: "r",
-      default: false
+      default: false,
     },
     focus: {
       type: "string",
       short: "f",
-      default: "50"
     },
     "video-size": {
       type: "string",
       short: "v",
-      default: "1280x720"
+      default: "1920x1080",
     },
   },
   strict: true,
@@ -26,19 +25,18 @@ const { values, positionals } = parseArgs({
 });
 const RECORD = values.record;
 
-const FOCUS = Number.parseInt(values.focus);
-if (Number.isNaN(FOCUS)) {
+const FOCUS = values.focus ? Number.parseInt(values.focus) : undefined;
+if (values.focus && Number.isNaN(FOCUS)) {
   console.log("Arg --focus has to be an integer");
   process.exit(1);
 }
 
 const VIDEO_SIZE = values["video-size"];
-const vs_regex = /^\d+x\d+$/
+const vs_regex = /^\d+x\d+$/;
 if (vs_regex.test(VIDEO_SIZE) === false) {
   console.log("Arg --video-size has to meet pattern /^\\d+x\\d+$/");
   process.exit(1);
 }
-
 
 console.log("Starting Webcam~");
 if (RECORD) {
@@ -48,15 +46,24 @@ if (RECORD) {
 const DEVICE = (
   await Bun.$`v4l2-ctl --list-devices | grep "Logitech BRIO" -A 1 | tail -n 1 | xargs`.text()
 ).trim();
+//configure the web cam settings
 console.log(`Selected cam device: ${DEVICE}`);
+console.log(`Video size: ${VIDEO_SIZE}`);
+Bun.$`v4l2-ctl -d ${DEVICE} --set-fmt-video=width=${VIDEO_SIZE.split("x")[0]},height=${VIDEO_SIZE.split("x")[1]},pixelformat=MJPG,framerate=60`;
+//Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=white_balance_automatic=0`;
+//Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=white_balance_temperature=4500`;
 
 Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=auto_exposure=1`;
 Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=exposure_time_absolute=400`;
 Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=gain=0`;
 Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=backlight_compensation=0`;
 Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=zoom_absolute=300`;
-Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=focus_automatic_continuous=0`;
-Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=focus_absolute=${FOCUS}`;
+
+if (FOCUS !== undefined) {
+  console.log(`Focus set to: ${FOCUS}`);
+  Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=focus_automatic_continuous=0`;
+  Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=focus_absolute=${FOCUS}`;
+}
 //Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=pan_absolute=3600`;
 //Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=tilt_absolute=3600`;
 
@@ -96,4 +103,3 @@ if (result_ptr) {
   await Bun.$`ffmpeg -i ${VIDEO} -i ${VOICE} -i ${EFFECTS} -filter_complex "[1:a][2:a]amerge=inputs=2[aout]" -map 0:v -map "[aout]" -c:v copy -ac 4 -c:a aac ${OUTPUT} -y`;
   console.log(`Final output saved in: ${OUTPUT}`);
 } */
-

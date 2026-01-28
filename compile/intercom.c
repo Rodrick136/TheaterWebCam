@@ -358,13 +358,12 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer data)
 // video_size of the device to be set, passes /^\d+x\d+$/
 char *start_cam(char *device_path, int should_record)
 {
-    // print setup values
-    fprintf(stdout, "Starting webcam with device: %s\n", device_path);
-    fprintf(stdout, "Recording enabled: %s\n", should_record ? "Yes" : "No");
-
     char *error;
 
     setup_log_file("intercom_log.txt");
+    // print setup values
+    print_log("Starting webcam with device: %s\n", device_path);
+    print_log("Recording enabled: %s\n", should_record ? "Yes" : "No");
 
     {
         // Setup window key events
@@ -602,7 +601,7 @@ static char *setup_recording_branch(GstElement *tee)
 
     // Configure recording queue - leaky to prevent blocking
     g_object_set(record_queue,
-                 "max-size-buffers", 200,
+                 "max-size-buffers", 600,
                  "max-size-bytes", 0,
                  "max-size-time", 0,
                  "leaky", 2,
@@ -610,27 +609,26 @@ static char *setup_recording_branch(GstElement *tee)
 
     // Configure muxer queue - also leaky to decouple muxer from encoder
     g_object_set(muxer_queue,
-                 "max-size-buffers", 100,
+                 "max-size-buffers", 300,
                  "max-size-bytes", 0,
                  "max-size-time", 0,
                  "leaky", 2,
                  NULL);
 
-    // Configure encoder for AVCC + low-latency
+    // Configure encoder for higher quality
     g_object_set(encoder,
-                 //"byte-stream", FALSE, // AVCC format required by mp4mux
-                 "speed-preset", 6, // ultrafast
-                 "bitrate", 2048,   // ~2 Mbps
-                 //"key-int-max", 30,    // frequent IDR
-                 //"bframes", 0,         // no reordering
-                 //"rc-lookahead", 0,    // no lookahead
+                 "speed-preset", 6,       // Medium preset for better quality
+                 "bitrate", 8192,        // Increase bitrate to ~8 Mbps
+                 "key-int-max", 60,      // Set keyframe interval to 60 frames
+                 "qp-min", 10,           // Minimum quantizer for better quality
                  NULL);
-    // Set tune=zerolatency if available (parse via util to avoid enum mismatch)
+
+    // Set tune=film for better quality in high-motion scenes
     {
         GParamSpec *ps = g_object_class_find_property(G_OBJECT_GET_CLASS(encoder), "tune");
         if (ps)
         {
-            gst_util_set_object_arg(G_OBJECT(encoder), "tune", "zerolatency");
+            gst_util_set_object_arg(G_OBJECT(encoder), "tune", "film");
         }
     }
 
