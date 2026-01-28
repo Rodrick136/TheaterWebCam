@@ -33,7 +33,7 @@ static void setup_log_window()
     }
 
     scrollok(log_window, TRUE); // Enable scrolling
-    wrefresh(log_window);      // Refresh the window to make it visible
+    wrefresh(log_window);       // Refresh the window to make it visible
 }
 
 static int log_file_fd = -1; // File descriptor for the log file
@@ -66,70 +66,80 @@ static void close_log_file()
 
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER; // Mutex for thread safety
 
-static void write_to_log_window(const char *prefix, const char *format, ...) {
-    va_list args;
-    va_start(args, format);
-
-    char *full_msg;
-    if (vasprintf(&full_msg, format, args) == -1) {
-        // Handle allocation failure
-        fprintf(stderr, "Error: Failed to allocate memory for log message\n");
-        va_end(args);
-        return;
-    }
-
-    // Prepend the prefix
-    char *final_msg;
-    if (asprintf(&final_msg, "%s%s", prefix, full_msg) == -1) {
-        fprintf(stderr, "Error: Failed to allocate memory for prefixed log message\n");
-        free(full_msg);
-        va_end(args);
-        return;
-    }
-
+static void write_to_log_window(const char *message)
+{
     pthread_mutex_lock(&log_mutex); // Lock the mutex for thread safety
 
     // Log to ncurses window
-    if (log_window) {
-        wprintw(log_window, "%s", final_msg);
+    if (log_window)
+    {
+        wprintw(log_window, message);
         wrefresh(log_window);
-    } else {
-        fprintf(stdout, "%s\n", final_msg);
+    } 
+    else
+    {
+        printf("%s", message);
     }
 
     // Log to file
-    if (log_file_fd != -1) {
-        dprintf(log_file_fd, "%s\n", final_msg);
+    if (log_file_fd != -1)
+    {
+        // Write to log file
+        write(log_file_fd, message, strlen(message));
     }
-
+    
     pthread_mutex_unlock(&log_mutex); // Unlock the mutex
-
-    free(full_msg);
-    free(final_msg);
-    va_end(args);
 }
+
 static void print_log(const char *format, ...)
 {
     va_list args;
-    va_start(args, format);
-    write_to_log_window("[LOG] ", format, args);
-    va_end(args);
+    va_start(args, format); // Initialize the va_list
+    char *full_msg;
+    vasprintf(&full_msg, format, args); // Use the va_list
+    va_end(args); // Clean up the va_list
+
+    // Prepend prefix
+    char *final_msg;
+    asprintf(&final_msg, "%s%s", "[LOG] ", full_msg);
+
+    write_to_log_window(final_msg);
+    free(full_msg);
+    free(final_msg);
 }
 
 static void print_warning(const char *format, ...)
 {
     va_list args;
-    va_start(args, format);
-    write_to_log_window("[WARNING] ", format, args);
-    va_end(args);
+    va_start(args, format); // Initialize the va_list
+    char *full_msg;
+    vasprintf(&full_msg, format, args); // Use the va_list
+    va_end(args); // Clean up the va_list
+
+    // Prepend prefix
+    char *final_msg;
+    asprintf(&final_msg, "%s%s", "[WARNING] ", full_msg);
+
+    write_to_log_window(final_msg);
+    free(full_msg);
+    free(final_msg);
 }
 
 static void print_error(const char *format, ...)
 {
     va_list args;
-    va_start(args, format);
-    write_to_log_window("[ERROR] ", format, args);
-    va_end(args);
+    va_start(args, format); // Initialize the va_list
+    char *full_msg;
+    vasprintf(&full_msg, format, args); // Use the va_list
+    va_end(args); // Clean up the va_list
+
+    // Prepend prefix
+    char *final_msg;
+    asprintf(&final_msg, "%s%s", "[ERROR] ", full_msg);
+
+    write_to_log_window(final_msg);
+    free(full_msg);
+    free(final_msg);
 }
 
 static void print_props(GObject *object)
@@ -310,11 +320,15 @@ static gboolean is_display_window_closed(const GError *err)
     return err && err->message && g_strrstr(err->message, "window was closed") != NULL;
 }
 
-static void signal_handler(int signum) {
+static void signal_handler(int signum)
+{
     const char *signal_name = strsignal(signum);
-    print_log("Received signal %d (%s), cleaning up...\n", signum, signal_name ? signal_name : "Unknown");
+    char buffer[256];
+    snprintf(buffer, sizeof(buffer), "Received signal %d (%s), cleaning up...\n", signum, signal_name ? signal_name : "Unknown");
+    print_log(buffer);
 
-    if (g_main_loop) {
+    if (g_main_loop)
+    {
         g_main_loop_quit(g_main_loop);
     }
 }
@@ -334,7 +348,9 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer data)
         }
         else
         {
-            print_error("Error: %s\n", err->message);
+            char buffer[256];
+            snprintf(buffer, sizeof(buffer), "Error: %s\n", err->message);
+            print_error(buffer);
         }
         g_error_free(err);
         g_free(debug);
@@ -357,13 +373,12 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer data)
 // device_path takes the form of /dev/video0
 // should_record is 1 to enable recording, 0 to disable
 // video_size of the device to be set, passes /^\d+x\d+$/
-char *start_cam(char *device_path, int should_record, char *video_size)
+char *start_cam(char *device_path, int should_record)
 {
     // print setup values
-    print_log("Starting webcam with device: %s\n", device_path);
-    print_log("Recording enabled: %s\n", should_record ? "Yes" : "No");
-    print_log("Video size: %s\n", video_size);
-    
+    fprintf(stdout, "Starting webcam with device: %s\n", device_path);
+    fprintf(stdout, "Recording enabled: %s\n", should_record ? "Yes" : "No");
+
     char *error;
 
     setup_log_file("intercom_log.txt");
@@ -378,7 +393,7 @@ char *start_cam(char *device_path, int should_record, char *video_size)
         }
     }
 
-    GstElement *source, *capsfilter, *decoder, *convert, *tee, *display_queue, *display_sink;
+    GstElement *source, *decoder, *convert, *tee, *display_queue, *display_sink;
     GstBus *bus;
 
     // Initialize GStreamer
@@ -389,7 +404,6 @@ char *start_cam(char *device_path, int should_record, char *video_size)
 
     // Create common elements
     source = gst_element_factory_make("v4l2src", "source");
-    capsfilter = gst_element_factory_make("capsfilter", "capsfilter");
     convert = gst_element_factory_make("videoconvert", "convert");
     tee = gst_element_factory_make("tee", "tee");
     display_queue = gst_element_factory_make("queue", "display_queue");
@@ -402,7 +416,7 @@ char *start_cam(char *device_path, int should_record, char *video_size)
         return "Missing jpegdec GStreamer plugin";
     }
 
-    if (!g_pipeline || !source || !capsfilter || !convert || !tee || !display_queue || !display_sink)
+    if (!g_pipeline || !source || !convert || !tee || !display_queue || !display_sink)
     {
         print_error("Failed to create basic pipeline elements.\n");
         return "Failed to create GStreamer elements";
@@ -420,37 +434,18 @@ char *start_cam(char *device_path, int should_record, char *video_size)
                  "qos", TRUE,
                  NULL);
 
-    // Parse and set video size via capsfilter (not on v4l2src)
-    int width, height;
-    if (sscanf(video_size, "%dx%d", &width, &height) == 2)
-    {
-        GstCaps *caps = gst_caps_new_simple("image/jpeg",
-                                            "width", G_TYPE_INT, width,
-                                            "height", G_TYPE_INT, height,
-                                            "framerate", GST_TYPE_FRACTION, 30, 1,
-                                            NULL);
-        g_object_set(capsfilter, "caps", caps, NULL);
-        gst_caps_unref(caps);
-        print_log("Video size set to: %dx%d\n", width, height);
-    }
-    else
-    {
-        print_error("Invalid video size format: %s\n", video_size);
-        return "Invalid video size format. Expected \\d+x\\d+.";
-    }
-
     // Configure tee to not block if one branch is slower
     g_object_set(tee,
                  "allow-not-linked", TRUE, // Don't fail if a branch returns not-linked
                  NULL);
 
     // Add basic elements to pipeline
-    gst_bin_add_many(GST_BIN(g_pipeline), source, capsfilter, decoder, convert, tee, display_queue, display_sink, NULL);
+    gst_bin_add_many(GST_BIN(g_pipeline), source, decoder, convert, tee, display_queue, display_sink, NULL);
 
-    // Link: source -> capsfilter -> decoder -> convert -> tee
-    if (!gst_element_link_many(source, capsfilter, decoder, convert, tee, NULL))
+    // Link: source -> decoder -> convert -> tee
+    if (!gst_element_link_many(source, decoder, convert, tee, NULL))
     {
-        print_error("Failed to link source -> capsfilter -> decoder -> convert -> tee.\n");
+        print_error("Failed to link source -> decoder -> convert -> tee.\n");
         gst_object_unref(g_pipeline);
         return "Failed to link GStreamer elements";
     }
@@ -559,7 +554,7 @@ char *start_cam(char *device_path, int should_record, char *video_size)
     g_main_loop_unref(g_main_loop);
 
     endwin(); // End ncurses
-    
+
     close_log_file();
 
     return NULL;
