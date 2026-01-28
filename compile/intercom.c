@@ -16,8 +16,6 @@ static GstPad *g_recording_src_pad = NULL; // Global variable to store the pad
 static GstElement *g_voice_pipeline = NULL; // Separate pipeline for voice audio
 static GstElement *g_fx_pipeline = NULL;    // Separate pipeline for effects audio
 
-// Global variable to track the last sync marker timestamp
-static GstClockTime g_last_sync_marker = GST_CLOCK_TIME_NONE;
 static GMutex g_sync_marker_mutex; // Mutex for thread-safe access to sync marker
 
 // Forward declarations
@@ -322,21 +320,197 @@ static GstPadProbeReturn video_pad_probe(GstPad *pad, GstPadProbeInfo *info, gpo
             const GstStructure *structure = gst_event_get_structure(event);
             if (gst_structure_has_name(structure, "sync-marker"))
             {
-                print_log("Sync marker event received on video pipeline.\n");
+                print_log("[video_pad_probe] Sync marker event received. Inserting white frame.\n");
 
-                // Create an all-white frame
-                GstBuffer *buffer = gst_buffer_new_allocate(NULL, 1920 * 1080 * 3, NULL); // Assuming 1920x1080 RGB
+                GstCaps *caps = gst_pad_get_current_caps(pad);
+                GstPad *peer = NULL;
+                if (!caps)
+                {
+                    peer = gst_pad_get_peer(pad);
+                    if (peer)
+                    {
+                        caps = gst_pad_get_current_caps(peer);
+                    }
+                }
+
+                if (!caps || gst_caps_is_empty(caps))
+                {
+                    print_warning("[video_pad_probe] Cannot determine pad caps; dropping sync marker.\n");
+                    if (peer)
+                        gst_object_unref(peer);
+                    if (caps)
+                        gst_caps_unref(caps);
+                    return GST_PAD_PROBE_DROP;
+                }
+
+                const GstStructure *cap_struct = gst_caps_get_structure(caps, 0);
+                int width = 0, height = 0;
+                const char *format = gst_structure_get_string(cap_struct, "format");
+
+                if (!gst_structure_get_int(cap_struct, "width", &width) ||
+                    !gst_structure_get_int(cap_struct, "height", &height) ||
+                    !format)
+                {
+                    print_warning("[video_pad_probe] Caps missing width/height/format; dropping sync marker.\n");
+                    if (peer)
+                        gst_object_unref(peer);
+                    gst_caps_unref(caps);
+                    return GST_PAD_PROBE_DROP;
+                }
+
+                size_t buf_size = 0;
+                gboolean handled = TRUE;
+
+                if (g_str_equal(format, "I420") || g_str_equal(format, "YV12"))
+                {
+                    buf_size = width * height * 3 / 2;
+                }
+                else if (g_str_equal(format, "NV12"))
+                {
+                    buf_size = width * height * 3 / 2;
+                }
+                else if (g_str_equal(format, "YUY2") || g_str_equal(format, "YUYV"))
+                {
+                    buf_size = width * height * 2;
+                }
+                else if (g_str_has_prefix(format, "RGB") || g_str_has_prefix(format, "BGR"))
+                {
+                    // handle RGB, RGBx, RGBA, BGRx, etc.
+                    if (g_str_equal(format, "RGB") || g_str_equal(format, "BGR"))
+                        buf_size = width * height * 3;
+                    else if (g_str_has_suffix(format, "A") || g_str_has_suffix(format, "x") || g_str_has_suffix(format, "X"))
+                        buf_size = width * height * 4;
+                    else
+                        buf_size = width * height * 3;
+                }
+                else if (g_str_equal(format, "GRAY8") || g_str_equal(format, "GRAY"))
+                {
+                    buf_size = width * height;
+                }
+                else
+                {
+                    handled = FALSE;
+                }
+
+                if (!handled || buf_size == 0)
+                {
+                    print_warning("[video_pad_probe] Unsupported video format '%s'; dropping sync marker.\n", format ? format : "unknown");
+                    if (peer)
+                        gst_object_unref(peer);
+                    gst_caps_unref(caps);
+                    return GST_PAD_PROBE_DROP;
+                }
+
+                GstBuffer *buffer = gst_buffer_new_allocate(NULL, buf_size, NULL);
+                if (!buffer)
+                {
+                    print_error("[video_pad_probe] Failed to allocate buffer for white frame.\n");
+                    if (peer)
+                        gst_object_unref(peer);
+                    gst_caps_unref(caps);
+                    return GST_PAD_PROBE_DROP;
+                }
+
                 GstMapInfo map;
-                gst_buffer_map(buffer, &map, GST_MAP_WRITE);
-                memset(map.data, 0xFF, map.size); // Set all pixels to white
+                if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE))
+                {
+                    print_error("[video_pad_probe] Failed to map buffer for white frame.\n");
+                    gst_buffer_unref(buffer);
+                    if (peer)
+                        gst_object_unref(peer);
+                    gst_caps_unref(caps);
+                    return GST_PAD_PROBE_DROP;
+                }
+
+                // Fill according to format
+                if (g_str_equal(format, "I420") || g_str_equal(format, "YV12"))
+                {
+                    // I420: Y plane, then U plane (w/2*h/2), then V plane
+                    size_t y_size = width * height;
+                    size_t uv_size = (width/2) * (height/2);
+                    // Y = 255 (white), U = V = 128
+                    memset(map.data, 0xFF, y_size);
+                    memset(map.data + y_size, 0x80, uv_size);
+                    memset(map.data + y_size + uv_size, 0x80, uv_size);
+                }
+                else if (g_str_equal(format, "NV12"))
+                {
+                    // NV12: Y plane then interleaved UV
+                    size_t y_size = width * height;
+                    size_t uv_size = width * height / 2;
+                    memset(map.data, 0xFF, y_size);
+                    // interleaved UV bytes: set both to 128
+                    memset(map.data + y_size, 0x80, uv_size);
+                }
+                else if (g_str_equal(format, "YUY2") || g_str_equal(format, "YUYV"))
+                {
+                    // Packed YUYV: Y0 U0 Y1 V0 ...
+                    // We'll set Y=255 and chroma bytes to 128
+                    for (size_t i = 0; i < map.size; i += 4)
+                    {
+                        map.data[i + 0] = 0xFF; // Y0
+                        map.data[i + 1] = 0x80; // U0
+                        map.data[i + 2] = 0xFF; // Y1
+                        map.data[i + 3] = 0x80; // V0
+                    }
+                }
+                else if (g_str_has_prefix(format, "RGB") || g_str_has_prefix(format, "BGR"))
+                {
+                    // Fill RGB/BGR with 255 (white)
+                    memset(map.data, 0xFF, map.size);
+                }
+                else if (g_str_equal(format, "RGBA") || g_str_equal(format, "BGRA"))
+                {
+                    // Set RGB to 255 and alpha to 255
+                    for (size_t i = 0; i < map.size; i += 4)
+                    {
+                        map.data[i + 0] = 0xFF;
+                        map.data[i + 1] = 0xFF;
+                        map.data[i + 2] = 0xFF;
+                        map.data[i + 3] = 0xFF;
+                    }
+                }
+                else if (g_str_equal(format, "GRAY8") || g_str_equal(format, "GRAY"))
+                {
+                    memset(map.data, 0xFF, map.size);
+                }
+                else
+                {
+                    // Shouldn't reach here due to earlier check, but safe fallback
+                    memset(map.data, 0xFF, map.size);
+                }
+
                 gst_buffer_unmap(buffer, &map);
 
-                // Push the buffer downstream
-                gst_pad_push(pad, buffer);
+                // Optional: set a timestamp so downstream doesn't get odd ordering
+                GST_BUFFER_PTS(buffer) = gst_clock_get_time(gst_element_get_clock(GST_ELEMENT(g_pipeline))) - gst_element_get_base_time(GST_ELEMENT(g_pipeline));
+
+                print_log("[video_pad_probe] Pushing buffer of size: %zu bytes (format=%s %dx%d)\n", buf_size, format, width, height);
+
+                if (gst_pad_push(pad, buffer) != GST_FLOW_OK)
+                {
+                    print_warning("[video_pad_probe] Failed to push white frame buffer downstream.\n");
+                }
+
+                if (peer)
+                    gst_object_unref(peer);
+                gst_caps_unref(caps);
 
                 return GST_PAD_PROBE_DROP; // Drop the event after handling
             }
+            else
+            {
+                print_log("[video_pad_probe] Received custom event, but not a sync marker.\n");
+            }
         }
+        else
+        {
+            print_log("[video_pad_probe] Received non-custom downstream event.\n");
+        }
+    }
+    else
+    {
+        print_log("[video_pad_probe] Probe triggered, but not an event downstream type.\n");
     }
     return GST_PAD_PROBE_OK;
 }
@@ -821,26 +995,17 @@ static char *setup_recording_branch(GstElement *tee)
     // Add video recording elements to pipeline
     gst_bin_add_many(GST_BIN(g_pipeline), record_queue, encoder, muxer_queue, video_muxer, video_file_sink, NULL);
 
-    // Request a new pad from the tee element
+    // Request a single new pad from the tee element for recording and attach probe to it
     tee_record_pad = gst_element_request_pad_simple(tee, "src_%u");
-    if (!tee_record_pad)
+    if (!tee_record_pad || !GST_IS_PAD(tee_record_pad))
     {
         print_error("Failed to request tee record pad.\n");
         return "Failed to request tee record pad";
     }
 
-    {
-        // Request a new pad from the tee element using the valid src_%u template
-        GstPad *tee_pad_probe = gst_element_request_pad_simple(tee, "src_%u");
-        if (!tee_pad_probe || !GST_IS_PAD(tee_pad_probe))
-        {
-            print_error("Failed to create a valid pad from tee using src_%u.\n");
-        }
-
-        // Attach a probe to the requested pad
-        gst_pad_add_probe(tee_pad_probe, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, video_pad_probe, NULL, NULL);
-        g_recording_src_pad = tee_pad_probe;
-    }
+    // Attach a probe to the requested pad and store it globally for sync-marker pushes
+    gst_pad_add_probe(tee_record_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, video_pad_probe, NULL, NULL);
+    g_recording_src_pad = tee_record_pad;
 
     // Get the sink pad of the record queue
     queue_record_pad = gst_element_get_static_pad(record_queue, "sink");
