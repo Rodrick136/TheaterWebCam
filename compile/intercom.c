@@ -4,6 +4,8 @@
 #include <sys/stat.h>
 #include <ncurses.h>
 #include <pthread.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 static GMainLoop *g_main_loop = NULL;
 static GstElement *g_pipeline = NULL;
@@ -19,59 +21,98 @@ static void configure_audio_pipeline(const char *name, const char *client_name, 
 static char *setup_display_branch(GstElement *tee, GstElement *display_queue, GstElement *display_sink);
 static char *setup_recording_branch(GstElement *tee);
 
-static WINDOW *log_pad;
-static int log_pad_height = 1000; // Initial height of the pad
-static int log_pad_width;
-static int log_pad_current_line = 0; // Tracks the current line for writing logs
+static WINDOW *log_window;
 
-static void setup_log_pad()
+static void setup_log_window()
 {
-    log_pad_width = COLS; // Use the full width of the terminal
-    log_pad_height = LINES; // Use the full height of the terminal
-    log_pad = newpad(log_pad_height, log_pad_width);
-    if (!log_pad)
+    log_window = newwin(LINES, COLS, 0, 0); // Create a new window with full terminal dimensions
+    if (!log_window)
     {
-        fprintf(stderr, "Failed to create log pad\n");
+        fprintf(stderr, "Failed to create log window\n");
         exit(1);
     }
-    scrollok(log_pad, TRUE); // Enable scrolling
 
-    // Ensure the log_pad is always visible by refreshing the entire screen
-    prefresh(log_pad, 0, 0, 0, 0, LINES - 1, COLS - 1);
+    scrollok(log_window, TRUE); // Enable scrolling
+    wrefresh(log_window);      // Refresh the window to make it visible
 }
 
-static void write_to_log_pad(const char *prefix, const char *format, va_list args)
+static int log_file_fd = -1; // File descriptor for the log file
+
+static void setup_log_file(const char *file_path)
 {
-    if (log_pad)
+    log_file_fd = open(file_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (log_file_fd == -1)
     {
-        char message[1024];
-        vsnprintf(message, sizeof(message), format, args);
-
-        // Write to the pad with prefix
-        mvwprintw(log_pad, log_pad_current_line++, 0, "%s%s", prefix, message);
-        if (log_pad_current_line >= log_pad_height)
-        {
-            log_pad_height *= 2; // Double the pad height if we exceed it
-            wresize(log_pad, log_pad_height, log_pad_width);
-        }
-
-        // Refresh the visible portion of the pad
-        prefresh(log_pad, log_pad_current_line - LINES + 5, 0, 0, 0, LINES - 1, COLS - 1);
+        fprintf(stderr, "Failed to open log file: %s\n", file_path);
+        exit(1);
     }
-    else
+
+    char time_buffer[64];
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    strftime(time_buffer, sizeof(time_buffer) - 1, "%Y-%m-%d %H:%M:%S", t);
+    dprintf(log_file_fd, "\nStarting new log session:\n");
+    dprintf(log_file_fd, "[TIMESTAMP] %s\n\n", time_buffer);
+}
+
+static void close_log_file()
+{
+    if (log_file_fd != -1)
     {
-        // Fallback to standard output if log_pad is not initialized
-        fprintf(stdout, "%s", prefix);
-        vfprintf(stdout, format, args);
-        fprintf(stdout, "\n");
+        close(log_file_fd);
+        log_file_fd = -1;
     }
 }
 
+static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER; // Mutex for thread safety
+
+static void write_to_log_window(const char *prefix, const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+
+    char *full_msg;
+    if (vasprintf(&full_msg, format, args) == -1) {
+        // Handle allocation failure
+        fprintf(stderr, "Error: Failed to allocate memory for log message\n");
+        va_end(args);
+        return;
+    }
+
+    // Prepend the prefix
+    char *final_msg;
+    if (asprintf(&final_msg, "%s%s", prefix, full_msg) == -1) {
+        fprintf(stderr, "Error: Failed to allocate memory for prefixed log message\n");
+        free(full_msg);
+        va_end(args);
+        return;
+    }
+
+    pthread_mutex_lock(&log_mutex); // Lock the mutex for thread safety
+
+    // Log to ncurses window
+    if (log_window) {
+        wprintw(log_window, "%s", final_msg);
+        wrefresh(log_window);
+    } else {
+        fprintf(stdout, "%s\n", final_msg);
+    }
+
+    // Log to file
+    if (log_file_fd != -1) {
+        dprintf(log_file_fd, "%s\n", final_msg);
+    }
+
+    pthread_mutex_unlock(&log_mutex); // Unlock the mutex
+
+    free(full_msg);
+    free(final_msg);
+    va_end(args);
+}
 static void print_log(const char *format, ...)
 {
     va_list args;
     va_start(args, format);
-    write_to_log_pad("[LOG] ", format, args);
+    write_to_log_window("[LOG] ", format, args);
     va_end(args);
 }
 
@@ -79,17 +120,125 @@ static void print_warning(const char *format, ...)
 {
     va_list args;
     va_start(args, format);
-    write_to_log_pad("[WARNING] ", format, args);
+    write_to_log_window("[WARNING] ", format, args);
     va_end(args);
 }
 
 static void print_error(const char *format, ...)
 {
-
     va_list args;
     va_start(args, format);
-    write_to_log_pad("[ERROR] ", format, args);
+    write_to_log_window("[ERROR] ", format, args);
     va_end(args);
+}
+
+static void print_props(GObject *object)
+{
+    if (!object)
+    {
+        print_warning("Cannot print properties of a NULL object.\n");
+        return;
+    }
+
+    GParamSpec **props;
+    guint n_props;
+
+    props = g_object_class_list_properties(G_OBJECT_GET_CLASS(object), &n_props);
+    if (!props || n_props == 0)
+    {
+        print_warning("No properties found for the given object.\n");
+        return;
+    }
+
+    print_log("Object properties:\n");
+    for (guint i = 0; i < n_props; i++)
+    {
+        print_log(" - %s\n", props[i]->name);
+    }
+
+    g_free(props);
+}
+
+static void print_element_properties(GstElement *element)
+{
+    if (!element)
+    {
+        print_warning("Cannot print properties of a NULL GstElement.\n");
+        return;
+    }
+
+    // Print properties of the GstElement itself
+    print_log("Properties of element: %s\n", GST_ELEMENT_NAME(element));
+    print_props(G_OBJECT(element));
+
+    // Iterate over pads and print their properties
+    GstIterator *pad_iter = gst_element_iterate_pads(element);
+    GValue pad_item = G_VALUE_INIT;
+    gboolean done = FALSE;
+
+    while (!done)
+    {
+        switch (gst_iterator_next(pad_iter, &pad_item))
+        {
+        case GST_ITERATOR_OK:
+        {
+            GstPad *pad = GST_PAD(g_value_get_object(&pad_item));
+            print_log("Properties of pad: %s\n", GST_PAD_NAME(pad));
+            print_props(G_OBJECT(pad));
+            g_value_reset(&pad_item);
+            break;
+        }
+        case GST_ITERATOR_RESYNC:
+            gst_iterator_resync(pad_iter);
+            break;
+        case GST_ITERATOR_ERROR:
+            print_error("Error iterating over pads.\n");
+            done = TRUE;
+            break;
+        case GST_ITERATOR_DONE:
+            done = TRUE;
+            break;
+        }
+    }
+
+    g_value_unset(&pad_item);
+    gst_iterator_free(pad_iter);
+
+    // If the element is a GstBin, iterate over its children
+    if (GST_IS_BIN(element))
+    {
+        GstIterator *child_iter = gst_bin_iterate_elements(GST_BIN(element));
+        GValue child_item = G_VALUE_INIT;
+        done = FALSE;
+
+        while (!done)
+        {
+            switch (gst_iterator_next(child_iter, &child_item))
+            {
+            case GST_ITERATOR_OK:
+            {
+                GstElement *child = GST_ELEMENT(g_value_get_object(&child_item));
+                print_log("\nChild element: %s\n", GST_ELEMENT_NAME(child));
+                print_element_properties(child); // Recursive call
+                g_value_reset(&child_item);
+                break;
+            }
+            case GST_ITERATOR_RESYNC:
+                gst_iterator_resync(child_iter);
+                break;
+            case GST_ITERATOR_ERROR:
+                print_error("Error iterating over child elements.\n");
+                done = TRUE;
+                break;
+            case GST_ITERATOR_DONE:
+                done = TRUE;
+                break;
+            }
+        }
+
+        g_value_unset(&child_item);
+        gst_iterator_free(child_iter);
+    }
 }
 
 static void *ncurses_event_listener(void *arg)
@@ -114,8 +263,7 @@ static void *ncurses_event_listener(void *arg)
                 raise(SIGTERM); // Send SIGTERM to exit the main loop
                 pthread_exit(NULL);
             default:
-                // print_log("Key pressed: %c\n", ch);
-                //  Do nothing for other keys
+                // Do nothing for other keys
                 break;
             }
         }
@@ -126,15 +274,7 @@ static void *ncurses_event_listener(void *arg)
 
 static void handle_resize(int sig)
 {
-    endwin(); // End ncurses mode to reset terminal dimensions
     refresh(); // Refresh ncurses to apply new dimensions
-
-    log_pad_width = COLS; // Update log_pad dimensions to match new terminal size
-    log_pad_height = LINES;
-    wresize(log_pad, log_pad_height, log_pad_width); // Resize the pad
-
-    // Ensure the log_pad is always visible by refreshing the entire screen
-    prefresh(log_pad, 0, 0, 0, 0, LINES - 1, COLS - 1);
 }
 
 static char *setup_ncurses()
@@ -150,7 +290,7 @@ static char *setup_ncurses()
     nodelay(stdscr, TRUE); // Non-blocking input
     keypad(stdscr, TRUE);
 
-    setup_log_pad();
+    setup_log_window();
 
     // Set up a signal handler for window resize events
     signal(SIGWINCH, handle_resize);
@@ -170,13 +310,11 @@ static gboolean is_display_window_closed(const GError *err)
     return err && err->message && g_strrstr(err->message, "window was closed") != NULL;
 }
 
-static void signal_handler(int signum)
-{
+static void signal_handler(int signum) {
     const char *signal_name = strsignal(signum);
     print_log("Received signal %d (%s), cleaning up...\n", signum, signal_name ? signal_name : "Unknown");
 
-    if (g_main_loop)
-    {
+    if (g_main_loop) {
         g_main_loop_quit(g_main_loop);
     }
 }
@@ -221,7 +359,14 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer data)
 // video_size of the device to be set, passes /^\d+x\d+$/
 char *start_cam(char *device_path, int should_record, char *video_size)
 {
+    // print setup values
+    print_log("Starting webcam with device: %s\n", device_path);
+    print_log("Recording enabled: %s\n", should_record ? "Yes" : "No");
+    print_log("Video size: %s\n", video_size);
+    
     char *error;
+
+    setup_log_file("intercom_log.txt");
 
     {
         // Setup window key events
@@ -413,36 +558,9 @@ char *start_cam(char *device_path, int should_record, char *video_size)
 
     g_main_loop_unref(g_main_loop);
 
-    // Store all logs from the pad into a buffer before ending ncurses
-    if (log_pad)
-    {
-        int height, width;
-        getmaxyx(log_pad, height, width);
-
-        char **buffer = malloc(log_pad_current_line * sizeof(char *));
-        for (int i = 0; i < log_pad_current_line; i++)
-        {
-            buffer[i] = malloc((width + 1) * sizeof(char)); // +1 for null terminator
-            memset(buffer[i], 0, width + 1);
-            mvwinnstr(log_pad, i, 0, buffer[i], width);
-        }
-
-        delwin(log_pad);
-        log_pad = NULL;
-        endwin();
-
-        // Print the buffered lines to stdout
-        for (int i = 0; i < log_pad_current_line; i++)
-        {
-            printf("%s\n", buffer[i]);
-            free(buffer[i]); // Free each line after printing
-        }
-        free(buffer); // Free the buffer array
-    }
-    else
-    {
-        endwin();
-    }
+    endwin(); // End ncurses
+    
+    close_log_file();
 
     return NULL;
 }
