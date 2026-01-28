@@ -36,3 +36,8 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 /Recording__*
 *.mp4
 *.mp3
+sa_intercom
+intercom.so
+intercom_log.txt
+
+dist
