@@ -451,14 +451,21 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer data)
 // should_record is 1 to enable recording, 0 to disable
 // video_size of the device to be set, passes /^\d+x\d+$/
 // framerate is either "30" or "60", it will be a string
-char *start_cam(char *device_path, int should_record, char *video_size, char *framerate)
+char *start_cam(char *dir_name, char *device_path, int should_record, char *video_size, char *framerate)
 {
     char *error;
 
     setup_log_file("intercom_log.txt");
     // print setup values
     print_log("Starting webcam with device: %s\n", device_path);
-    print_log("Recording enabled: %s\n", should_record ? "Yes" : "No");
+    print_log("Recording enabled: %s\n", should_record ? "Yes" : "No"); 
+
+    /* If caller provided a recording directory, use it instead of generating one */
+    if (should_record && dir_name && dir_name[0] != '\0')
+    {
+        snprintf(g_recording_folder, sizeof(g_recording_folder), "%s", dir_name);
+        print_log("Using provided recording folder: %s\n", g_recording_folder);
+    }
 
     {
         // Setup window key events
@@ -838,26 +845,33 @@ static char *setup_recording_branch(GstElement *tee)
     }
 
     // Configure video filesink
-    // create new folder for each new recording session
+    // Use `g_recording_folder` if provided by caller; otherwise create a timestamped folder
 
     char *name = "webcam_video.mp4";
-    char foldername[50];
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    strftime(foldername, sizeof(foldername) - 1, "Recording__%Y-%m-%dT%H:%M:%S", t);
-    mkdir(foldername, 0777); // create folder
-    char filepath[100];
-    snprintf(filepath, sizeof(filepath), "%s/%s", foldername, name);
+    if (g_recording_folder[0] == '\0')
+    {
+        char foldername[64];
+        time_t now = time(NULL);
+        struct tm *t = localtime(&now);
+        strftime(foldername, sizeof(foldername) - 1, "Recording__%Y-%m-%dT%H:%M:%S", t);
+        mkdir(foldername, 0777); // create folder
+        snprintf(g_recording_folder, sizeof(g_recording_folder), "%s", foldername);
+    }
+
+    // Ensure the folder exists
+    mkdir(g_recording_folder, 0777);
+
+    char filepath[256];
+    snprintf(filepath, sizeof(filepath), "%s/%s", g_recording_folder, name);
     g_object_set(video_file_sink,
                  "location", filepath,
                  "async", FALSE,
                  NULL);
 
-    /* Store recording folder and open markers.srt sidecar for writing */
-    snprintf(g_recording_folder, sizeof(g_recording_folder), "%s", foldername);
+    /* Open markers.srt sidecar for writing in the chosen recording folder */
     {
-        char markers_path[128];
-        snprintf(markers_path, sizeof(markers_path), "%s/markers.srt", foldername);
+        char markers_path[512];
+        snprintf(markers_path, sizeof(markers_path), "%s/markers.srt", g_recording_folder);
         g_srt_file = fopen(markers_path, "a");
         if (g_srt_file)
         {
@@ -869,8 +883,8 @@ static char *setup_recording_branch(GstElement *tee)
         }
 
         /* Also open CSV sidecar */
-        char csv_path[128];
-        snprintf(csv_path, sizeof(csv_path), "%s/markers.csv", foldername);
+        char csv_path[512];
+        snprintf(csv_path, sizeof(csv_path), "%s/markers.csv", g_recording_folder);
         g_csv_file = fopen(csv_path, "a+");
         if (g_csv_file)
         {
@@ -937,15 +951,44 @@ static char *setup_recording_branch(GstElement *tee)
     }
 
     // Configure and attach audio recording branch (non-fatal on failure)
-    char voice_out[100];
-    snprintf(voice_out, sizeof(voice_out), "%s/%s", foldername, "webcam_voice.mp3");
-    configure_audio_pipeline("Voice", "Voice In", voice_out, &g_voice_pipeline);
+    //char voice_out[100];
+    //snprintf(voice_out, sizeof(voice_out), "%s/%s", foldername, "webcam_voice.mp3");
+    //configure_audio_pipeline("Voice", "Voice In", voice_out, &g_voice_pipeline);
 
-    char effects_out[100];
-    snprintf(effects_out, sizeof(effects_out), "%s/%s", foldername, "webcam_effects.mp3");
-    configure_audio_pipeline("Effects", "Effects In", effects_out, &g_fx_pipeline);
+    //char effects_out[100];
+    //snprintf(effects_out, sizeof(effects_out), "%s/%s", foldername, "webcam_effects.mp3");
+    //configure_audio_pipeline("Effects", "Effects In", effects_out, &g_fx_pipeline);
 
     return NULL;
+}
+
+// Lightweight bus callback for audio pipelines to surface errors/EOS without exiting
+static gboolean audio_bus_callback(GstBus *bus, GstMessage *message, gpointer data)
+{
+    const char *pipeline_name = (const char *)data;
+    switch (GST_MESSAGE_TYPE(message))
+    {
+    case GST_MESSAGE_ERROR:
+    {
+        GError *err;
+        gchar *dbg;
+        gst_message_parse_error(message, &err, &dbg);
+        print_error("[Audio %s] Error: %s\n", pipeline_name ? pipeline_name : "(unknown)", err->message);
+        if (dbg)
+        {
+            print_log("[Audio %s] Debug: %s\n", pipeline_name ? pipeline_name : "(unknown)", dbg);
+            g_free(dbg);
+        }
+        g_error_free(err);
+        break;
+    }
+    case GST_MESSAGE_EOS:
+        print_log("[Audio %s] Received EOS\n", pipeline_name ? pipeline_name : "(unknown)");
+        break;
+    default:
+        break;
+    }
+    return TRUE;
 }
 
 static void configure_audio_pipeline(
@@ -994,6 +1037,7 @@ static void configure_audio_pipeline(
     g_object_set(file_sink,
                  "location", output_file,
                  "sync", FALSE,
+                 "async", FALSE,
                  NULL);
 
     // Add elements to pipeline
@@ -1059,5 +1103,11 @@ static void configure_audio_pipeline(
     else
     {
         print_log("[%s Audio] Started - recording to %s\n", name, output_file);
+        GstBus *ab = gst_element_get_bus(*pipeline_ptr);
+        if (ab)
+        {
+            gst_bus_add_watch(ab, audio_bus_callback, g_strdup(pipeline_name));
+            gst_object_unref(ab);
+        }
     }
 }

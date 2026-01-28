@@ -1,5 +1,6 @@
 import { cc, CString, dlopen, ptr, toBuffer } from "bun:ffi";
-import { parseArgs } from "util";
+import { mkdirSync } from "node:fs";
+import { parseArgs } from "node:util";
 
 // Parse command-line arguments
 const { values, positionals } = parseArgs({
@@ -76,40 +77,100 @@ if (FOCUS !== undefined) {
 //Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=pan_absolute=3600`;
 //Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=tilt_absolute=3600`;
 
+// Recording folder name
+const DIR_NAME = `Recording__${new Date().toISOString()}`;
+// Create recording directory if recording is enabled
+if (RECORD) {
+  mkdirSync(DIR_NAME);
+}
+
+// start recording audio here
+let _voiceProc: Bun.Subprocess | null = null;
+let _effectsProc: Bun.Subprocess | null = null;
+if (RECORD) {
+  const voicePath = `${DIR_NAME}/webcam_voice.wav`;
+  const effectsPath = `${DIR_NAME}/webcam_effects.wav`;
+
+  // spawn pw-record processes (run until terminated)
+  try {
+    _voiceProc = Bun.spawn({
+      cmd: [
+        "pw-record",
+        "--channels=1",
+        "--rate=48000",
+        "--properties",
+        `media.name=webcam_voice,node.name=webcam_voice,application.name=TheaterWebCam-Voice`,
+        voicePath,
+      ],
+      stdout: "inherit",
+      stdin: "inherit",
+      stderr: "inherit",
+    });
+  } catch (e) {
+    console.error("Failed to start voice recorder:", e);
+  }
+  try {
+    _effectsProc = Bun.spawn({
+      cmd: [
+        "pw-record",
+        "--channels=2",
+        "--rate=48000",
+        "--properties",
+        `media.name=webcam_effects,node.name=webcam_effects,application.name=TheaterWebCam-Effects`,
+        effectsPath,
+      ],
+      stdout: "inherit",
+      stdin: "inherit",
+      stderr: "inherit",
+    });
+  } catch (e) {
+    console.error("Failed to start effects recorder:", e);
+  }
+}
+
 //start the web cam stream
 const {
   symbols: { start_cam },
 } = dlopen("./compile/libintercom.so", {
   start_cam: {
-    args: ["cstring", "bool", "cstring", "cstring"],
+    args: ["cstring", "cstring", "bool", "cstring", "cstring"],
     returns: "ptr",
   },
 });
 
+const DIR_NAME_ptr = ptr(Buffer.from(DIR_NAME + "\0"));
 const DEVICE_ptr = ptr(Buffer.from(DEVICE + "\0"));
 const VIDEO_SIZE_ptr = ptr(Buffer.from(VIDEO_SIZE + "\0"));
 const FRAMERATE_ptr = ptr(Buffer.from(FRAMERATE + "\0"));
-const result_ptr = start_cam(DEVICE_ptr, RECORD, VIDEO_SIZE_ptr, FRAMERATE_ptr);
+const result_ptr = start_cam(
+  DIR_NAME_ptr,
+  DEVICE_ptr,
+  RECORD,
+  VIDEO_SIZE_ptr,
+  FRAMERATE_ptr,
+);
 if (result_ptr) {
   const result = new CString(result_ptr).toString();
   console.error("Error:", result);
   process.exit(1);
 }
 
-// find latest recording directory
-/* if (RECORD) {
-  const RECORDING_DIR = (
-    await Bun.$`/usr/bin/ls -td ./Recording__* | head -n 1`.text()
-  ).trim();
-  console.log(`Latest recording saved in: ${RECORDING_DIR}`);
+// When start_cam returns, stop recorders and await exit
+async function stopRecorders() {
+  const procs: Array<Promise<number>> = [];
+  if (_voiceProc) {
+    try {
+      _voiceProc.kill("SIGTERM");
+    } catch {}
+    if (_voiceProc.exited) procs.push(_voiceProc.exited);
+  }
+  if (_effectsProc) {
+    try {
+      _effectsProc.kill("SIGTERM");
+    } catch {}
+    if (_effectsProc.exited) procs.push(_effectsProc.exited);
+  }
+  await Promise.all(procs);
+}
 
-  // use ffmpeg to combine video and audio
-  console.log("Combining video and audio into final output file...");
-  const VIDEO = RECORDING_DIR + "/webcam_video.mp4"; // no audio yet
-  const VOICE = RECORDING_DIR + "/webcam_voice.mp3"; // 2 channels
-  const EFFECTS = RECORDING_DIR + "/webcam_effects.mp3"; // 2 channels
-
-  const OUTPUT = RECORDING_DIR + "/final_output.mp4";
-  await Bun.$`ffmpeg -i ${VIDEO} -i ${VOICE} -i ${EFFECTS} -filter_complex "[1:a][2:a]amerge=inputs=2[aout]" -map 0:v -map "[aout]" -c:v copy -ac 4 -c:a aac ${OUTPUT} -y`;
-  console.log(`Final output saved in: ${OUTPUT}`);
-} */
+await stopRecorders();
