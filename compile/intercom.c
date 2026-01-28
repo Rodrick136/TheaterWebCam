@@ -50,7 +50,7 @@ static void setup_log_file(const char *file_path)
     char time_buffer[64];
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
-    strftime(time_buffer, sizeof(time_buffer) - 1, "%Y-%m-%d %H:%M:%S", t);
+    strftime(time_buffer, sizeof(time_buffer) - 1, "%Y-%m-%dT%H:%M:%S", t);
     dprintf(log_file_fd, "\nStarting new log session:\n");
     dprintf(log_file_fd, "[TIMESTAMP] %s\n\n", time_buffer);
 }
@@ -66,80 +66,63 @@ static void close_log_file()
 
 static pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER; // Mutex for thread safety
 
-static void write_to_log_window(const char *message)
+static void write_log(const char *prefix, const char *format, va_list args)
 {
     pthread_mutex_lock(&log_mutex); // Lock the mutex for thread safety
+
+    // Format the message
+    char *formatted_msg;
+    vasprintf(&formatted_msg, format, args);
+
+    // Prepend the prefix
+    char *final_msg;
+    asprintf(&final_msg, "%s%s", prefix, formatted_msg);
 
     // Log to ncurses window
     if (log_window)
     {
-        wprintw(log_window, message);
+        wprintw(log_window, "%s", final_msg);
         wrefresh(log_window);
-    } 
+    }
     else
     {
-        printf("%s", message);
+        printf("%s", final_msg);
     }
 
     // Log to file
     if (log_file_fd != -1)
     {
-        // Write to log file
-        write(log_file_fd, message, strlen(message));
+        write(log_file_fd, final_msg, strlen(final_msg));
     }
-    
+
+    free(formatted_msg);
+    free(final_msg);
+
     pthread_mutex_unlock(&log_mutex); // Unlock the mutex
 }
 
 static void print_log(const char *format, ...)
 {
     va_list args;
-    va_start(args, format); // Initialize the va_list
-    char *full_msg;
-    vasprintf(&full_msg, format, args); // Use the va_list
-    va_end(args); // Clean up the va_list
-
-    // Prepend prefix
-    char *final_msg;
-    asprintf(&final_msg, "%s%s", "[LOG] ", full_msg);
-
-    write_to_log_window(final_msg);
-    free(full_msg);
-    free(final_msg);
+    va_start(args, format);
+    write_log("[LOG] ", format, args);
+    va_end(args);
 }
 
 static void print_warning(const char *format, ...)
 {
     va_list args;
-    va_start(args, format); // Initialize the va_list
-    char *full_msg;
-    vasprintf(&full_msg, format, args); // Use the va_list
-    va_end(args); // Clean up the va_list
-
-    // Prepend prefix
-    char *final_msg;
-    asprintf(&final_msg, "%s%s", "[WARNING] ", full_msg);
-
-    write_to_log_window(final_msg);
-    free(full_msg);
-    free(final_msg);
+    va_start(args, format);
+    write_log("[WARNING] ", format, args);
+    va_end(args);
 }
 
 static void print_error(const char *format, ...)
 {
     va_list args;
-    va_start(args, format); // Initialize the va_list
-    char *full_msg;
-    vasprintf(&full_msg, format, args); // Use the va_list
-    va_end(args); // Clean up the va_list
-
-    // Prepend prefix
-    char *final_msg;
-    asprintf(&final_msg, "%s%s", "[ERROR] ", full_msg);
-
-    write_to_log_window(final_msg);
-    free(full_msg);
-    free(final_msg);
+    va_start(args, format);
+    write_log("[ERROR] ", format, args);
+    va_end(args);
 }
 
 static void print_props(GObject *object)
