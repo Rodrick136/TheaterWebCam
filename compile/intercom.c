@@ -12,7 +12,6 @@
 static GMainLoop *g_main_loop = NULL;
 
 static GstElement *g_pipeline = NULL;
-static GstPad *g_recording_src_pad = NULL; // Global variable to store the pad
 
 static GstElement *g_voice_pipeline = NULL; // Separate pipeline for voice audio
 static GstElement *g_fx_pipeline = NULL;    // Separate pipeline for effects audio
@@ -20,6 +19,12 @@ static GstElement *g_fx_pipeline = NULL;    // Separate pipeline for effects aud
 static GMutex g_sync_marker_mutex; // Mutex for thread-safe access to sync marker
 
 // Forward declarations
+static FILE *g_srt_file = NULL;
+static FILE *g_csv_file = NULL;
+static int g_srt_index = 1;
+static char g_recording_folder[256] = {0};
+static void format_srt_time(guint64 ms, char *buf, size_t buflen);
+
 static void configure_audio_pipeline(const char *name, const char *client_name, const char *output_file, GstElement **pipeline_ptr);
 static char *setup_display_branch(GstElement *tee, GstElement *display_queue, GstElement *display_sink);
 static char *setup_recording_branch(GstElement *tee);
@@ -237,6 +242,21 @@ static void print_element_properties(GstElement *element)
     }
 }
 
+static void format_srt_time(guint64 ms, char *buf, size_t buflen)
+{
+    guint64 hours = ms / 3600000;
+    ms %= 3600000;
+    guint64 minutes = ms / 60000;
+    ms %= 60000;
+    guint64 seconds = ms / 1000;
+    guint64 msecs = ms % 1000;
+    snprintf(buf, buflen, "%02llu:%02llu:%02llu,%03llu",
+             (unsigned long long)hours,
+             (unsigned long long)minutes,
+             (unsigned long long)seconds,
+             (unsigned long long)msecs);
+}
+
 static void trigger_sync_markers()
 {
     g_mutex_lock(&g_sync_marker_mutex);
@@ -244,64 +264,60 @@ static void trigger_sync_markers()
     // Create a custom sync marker event
     GstEvent *sync_marker_event = gst_event_new_custom(GST_EVENT_CUSTOM_DOWNSTREAM, gst_structure_new_empty("sync-marker"));
 
-    // Insert sync marker into the video pipeline
-    if (g_pipeline && g_recording_src_pad)
+    /* Write sidecar SRT and CSV entry if recording is active and files are open */
+    if (g_pipeline)
     {
-        if (gst_pad_push_event(g_recording_src_pad, gst_event_ref(sync_marker_event)))
+        GstClock *clock = gst_element_get_clock(GST_ELEMENT(g_pipeline));
+        if (clock)
         {
-            print_log("Triggered sync marker event in video pipeline.\n");
-        }
-        else
-        {
-            print_warning("Failed to trigger sync marker event in video pipeline.\n");
-        }
-    }
-    else
-    {
-        print_warning("Video pipeline source pad not found.\n");
-    }
+            GstClockTime now = gst_clock_get_time(clock) - gst_element_get_base_time(GST_ELEMENT(g_pipeline));
+            guint64 ms = (guint64)(now / GST_MSECOND);
+            char start_ts[32];
+            char end_ts[32];
+            format_srt_time(ms, start_ts, sizeof(start_ts));
+            format_srt_time(ms + 10, end_ts, sizeof(end_ts)); /* 10ms duration */
 
-    // Insert sync marker into the voice audio pipeline
-    if (g_voice_pipeline)
-    {
-        GstPad *voice_src_pad = gst_element_get_static_pad(g_voice_pipeline, "src");
-        if (voice_src_pad)
-        {
-            if (gst_pad_push_event(voice_src_pad, gst_event_ref(sync_marker_event)))
+            if (g_srt_file)
             {
-                print_log("Triggered sync marker event in voice audio pipeline.\n");
+                fprintf(g_srt_file, "%d\n%s --> %s\nSync Marker\n\n", g_srt_index++, start_ts, end_ts);
+                fflush(g_srt_file);
             }
-            else
-            {
-                print_warning("Failed to trigger sync marker event in voice audio pipeline.\n");
-            }
-            gst_object_unref(voice_src_pad);
-        }
-        else
-        {
-            print_warning("Voice audio pipeline source pad not found.\n");
-        }
-    }
 
-    // Insert sync marker into the effects audio pipeline
-    if (g_fx_pipeline)
-    {
-        GstPad *fx_src_pad = gst_element_get_static_pad(g_fx_pipeline, "src");
-        if (fx_src_pad)
-        {
-            if (gst_pad_push_event(fx_src_pad, gst_event_ref(sync_marker_event)))
+            if (g_csv_file)
             {
-                print_log("Triggered sync marker event in effects audio pipeline.\n");
+                /* Convert SRT-style comma ms to dot for CSV (HH:MM:SS.mmm) */
+                char csv_ts[32];
+                strncpy(csv_ts, start_ts, sizeof(csv_ts));
+                char *p = strrchr(csv_ts, ',');
+                if (p) *p = '.';
+                fprintf(g_csv_file, "%s,%s\n", csv_ts, "Sync Marker");
+                fflush(g_csv_file);
             }
-            else
+
+            /* Also write an Audacity-compatible label file (start\tend\tlabel)
+             * so users can import markers directly into Audacity.
+             */
+            if (g_recording_folder[0] != '\0')
             {
-                print_warning("Failed to trigger sync marker event in effects audio pipeline.\n");
+                char labels_path[128];
+                snprintf(labels_path, sizeof(labels_path), "%s/markers.labels.txt", g_recording_folder);
+                FILE *lbl = fopen(labels_path, "a");
+                if (lbl)
+                {
+                    double start_sec = (double)ms / 1000.0;
+                    double end_sec = (double)(ms + 10) / 1000.0;
+                    fprintf(lbl, "%.3f\t%.3f\t%s\n", start_sec, end_sec, "Sync Marker");
+                    fclose(lbl);
+                    print_log("Wrote Audacity label: %s\n", labels_path);
+                }
+                else
+                {
+                    print_warning("Could not open Audacity labels file: %s\n", labels_path);
+                }
             }
-            gst_object_unref(fx_src_pad);
-        }
-        else
-        {
-            print_warning("Effects audio pipeline source pad not found.\n");
+
+            gst_object_unref(clock);
+            print_log("Appended SRT/CSV marker at %s (folder=%s)\n", start_ts, g_recording_folder);
         }
     }
 
@@ -309,247 +325,6 @@ static void trigger_sync_markers()
     gst_event_unref(sync_marker_event);
 
     g_mutex_unlock(&g_sync_marker_mutex);
-}
-
-static GstPadProbeReturn video_pad_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
-{
-    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM)
-    {
-        GstEvent *event = GST_PAD_PROBE_INFO_EVENT(info);
-        if (GST_EVENT_TYPE(event) == GST_EVENT_CUSTOM_DOWNSTREAM)
-        {
-            const GstStructure *structure = gst_event_get_structure(event);
-            if (gst_structure_has_name(structure, "sync-marker"))
-            {
-                print_log("[video_pad_probe] Sync marker event received. Inserting white frame.\n");
-
-                GstCaps *caps = gst_pad_get_current_caps(pad);
-                GstPad *peer = NULL;
-                if (!caps)
-                {
-                    peer = gst_pad_get_peer(pad);
-                    if (peer)
-                    {
-                        caps = gst_pad_get_current_caps(peer);
-                    }
-                }
-
-                if (!caps || gst_caps_is_empty(caps))
-                {
-                    print_warning("[video_pad_probe] Cannot determine pad caps; dropping sync marker.\n");
-                    if (peer)
-                        gst_object_unref(peer);
-                    if (caps)
-                        gst_caps_unref(caps);
-                    return GST_PAD_PROBE_DROP;
-                }
-
-                const GstStructure *cap_struct = gst_caps_get_structure(caps, 0);
-                int width = 0, height = 0;
-                const char *format = gst_structure_get_string(cap_struct, "format");
-
-                if (!gst_structure_get_int(cap_struct, "width", &width) ||
-                    !gst_structure_get_int(cap_struct, "height", &height) ||
-                    !format)
-                {
-                    print_warning("[video_pad_probe] Caps missing width/height/format; dropping sync marker.\n");
-                    if (peer)
-                        gst_object_unref(peer);
-                    gst_caps_unref(caps);
-                    return GST_PAD_PROBE_DROP;
-                }
-
-                size_t buf_size = 0;
-                gboolean handled = TRUE;
-
-                if (g_str_equal(format, "I420") || g_str_equal(format, "YV12"))
-                {
-                    buf_size = width * height * 3 / 2;
-                }
-                else if (g_str_equal(format, "NV12"))
-                {
-                    buf_size = width * height * 3 / 2;
-                }
-                else if (g_str_equal(format, "YUY2") || g_str_equal(format, "YUYV"))
-                {
-                    buf_size = width * height * 2;
-                }
-                else if (g_str_has_prefix(format, "RGB") || g_str_has_prefix(format, "BGR"))
-                {
-                    // handle RGB, RGBx, RGBA, BGRx, etc.
-                    if (g_str_equal(format, "RGB") || g_str_equal(format, "BGR"))
-                        buf_size = width * height * 3;
-                    else if (g_str_has_suffix(format, "A") || g_str_has_suffix(format, "x") || g_str_has_suffix(format, "X"))
-                        buf_size = width * height * 4;
-                    else
-                        buf_size = width * height * 3;
-                }
-                else if (g_str_equal(format, "GRAY8") || g_str_equal(format, "GRAY"))
-                {
-                    buf_size = width * height;
-                }
-                else
-                {
-                    handled = FALSE;
-                }
-
-                if (!handled || buf_size == 0)
-                {
-                    print_warning("[video_pad_probe] Unsupported video format '%s'; dropping sync marker.\n", format ? format : "unknown");
-                    if (peer)
-                        gst_object_unref(peer);
-                    gst_caps_unref(caps);
-                    return GST_PAD_PROBE_DROP;
-                }
-
-                GstBuffer *buffer = gst_buffer_new_allocate(NULL, buf_size, NULL);
-                if (!buffer)
-                {
-                    print_error("[video_pad_probe] Failed to allocate buffer for white frame.\n");
-                    if (peer)
-                        gst_object_unref(peer);
-                    gst_caps_unref(caps);
-                    return GST_PAD_PROBE_DROP;
-                }
-
-                GstMapInfo map;
-                if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE))
-                {
-                    print_error("[video_pad_probe] Failed to map buffer for white frame.\n");
-                    gst_buffer_unref(buffer);
-                    if (peer)
-                        gst_object_unref(peer);
-                    gst_caps_unref(caps);
-                    return GST_PAD_PROBE_DROP;
-                }
-
-                // Fill according to format
-                if (g_str_equal(format, "I420") || g_str_equal(format, "YV12"))
-                {
-                    // I420: Y plane, then U plane (w/2*h/2), then V plane
-                    size_t y_size = width * height;
-                    size_t uv_size = (width/2) * (height/2);
-                    // Y = 255 (white), U = V = 128
-                    memset(map.data, 0xFF, y_size);
-                    memset(map.data + y_size, 0x80, uv_size);
-                    memset(map.data + y_size + uv_size, 0x80, uv_size);
-                }
-                else if (g_str_equal(format, "NV12"))
-                {
-                    // NV12: Y plane then interleaved UV
-                    size_t y_size = width * height;
-                    size_t uv_size = width * height / 2;
-                    memset(map.data, 0xFF, y_size);
-                    // interleaved UV bytes: set both to 128
-                    memset(map.data + y_size, 0x80, uv_size);
-                }
-                else if (g_str_equal(format, "YUY2") || g_str_equal(format, "YUYV"))
-                {
-                    // Packed YUYV: Y0 U0 Y1 V0 ...
-                    // We'll set Y=255 and chroma bytes to 128
-                    for (size_t i = 0; i < map.size; i += 4)
-                    {
-                        map.data[i + 0] = 0xFF; // Y0
-                        map.data[i + 1] = 0x80; // U0
-                        map.data[i + 2] = 0xFF; // Y1
-                        map.data[i + 3] = 0x80; // V0
-                    }
-                }
-                else if (g_str_has_prefix(format, "RGB") || g_str_has_prefix(format, "BGR"))
-                {
-                    // Fill RGB/BGR with 255 (white)
-                    memset(map.data, 0xFF, map.size);
-                }
-                else if (g_str_equal(format, "RGBA") || g_str_equal(format, "BGRA"))
-                {
-                    // Set RGB to 255 and alpha to 255
-                    for (size_t i = 0; i < map.size; i += 4)
-                    {
-                        map.data[i + 0] = 0xFF;
-                        map.data[i + 1] = 0xFF;
-                        map.data[i + 2] = 0xFF;
-                        map.data[i + 3] = 0xFF;
-                    }
-                }
-                else if (g_str_equal(format, "GRAY8") || g_str_equal(format, "GRAY"))
-                {
-                    memset(map.data, 0xFF, map.size);
-                }
-                else
-                {
-                    // Shouldn't reach here due to earlier check, but safe fallback
-                    memset(map.data, 0xFF, map.size);
-                }
-
-                gst_buffer_unmap(buffer, &map);
-
-                // Optional: set a timestamp so downstream doesn't get odd ordering
-                GST_BUFFER_PTS(buffer) = gst_clock_get_time(gst_element_get_clock(GST_ELEMENT(g_pipeline))) - gst_element_get_base_time(GST_ELEMENT(g_pipeline));
-
-                print_log("[video_pad_probe] Pushing buffer of size: %zu bytes (format=%s %dx%d)\n", buf_size, format, width, height);
-
-                if (gst_pad_push(pad, buffer) != GST_FLOW_OK)
-                {
-                    print_warning("[video_pad_probe] Failed to push white frame buffer downstream.\n");
-                }
-
-                if (peer)
-                    gst_object_unref(peer);
-                gst_caps_unref(caps);
-
-                return GST_PAD_PROBE_DROP; // Drop the event after handling
-            }
-            else
-            {
-                print_log("[video_pad_probe] Received custom event, but not a sync marker.\n");
-            }
-        }
-        else
-        {
-            print_log("[video_pad_probe] Received non-custom downstream event.\n");
-        }
-    }
-    else
-    {
-        print_log("[video_pad_probe] Probe triggered, but not an event downstream type.\n");
-    }
-    return GST_PAD_PROBE_OK;
-}
-
-static GstPadProbeReturn audio_pad_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
-{
-    if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM)
-    {
-        GstEvent *event = GST_PAD_PROBE_INFO_EVENT(info);
-        if (GST_EVENT_TYPE(event) == GST_EVENT_CUSTOM_DOWNSTREAM)
-        {
-            const GstStructure *structure = gst_event_get_structure(event);
-            if (gst_structure_has_name(structure, "sync-marker"))
-            {
-                print_log("Sync marker event received on audio pipeline.\n");
-
-                // Generate a unique tone (e.g., 440 Hz sine wave)
-                GstBuffer *buffer = gst_buffer_new_allocate(NULL, 44100 * 2, NULL); // 1 second of audio at 44.1 kHz, 16-bit
-                GstMapInfo map;
-                gst_buffer_map(buffer, &map, GST_MAP_WRITE);
-
-                guint16 *samples = (guint16 *)map.data;
-                guint num_samples = map.size / sizeof(guint16);
-                for (guint i = 0; i < num_samples; i++)
-                {
-                    samples[i] = (guint16)(32767.0 * sin(2.0 * G_PI * 440.0 * i / 44100.0)); // 440 Hz tone
-                }
-
-                gst_buffer_unmap(buffer, &map);
-
-                // Push the buffer downstream
-                gst_pad_push(pad, buffer);
-
-                return GST_PAD_PROBE_DROP; // Drop the event after handling
-            }
-        }
-    }
-    return GST_PAD_PROBE_OK;
 }
 
 static void *ncurses_event_listener(void *arg)
@@ -917,12 +692,6 @@ char *start_cam(char *device_path, int should_record, char *video_size, char *fr
         g_pipeline = NULL; // Avoid dangling pointer
     }
 
-    if (g_recording_src_pad)
-    {
-        gst_object_unref(g_recording_src_pad);
-        g_recording_src_pad = NULL; // Avoid dangling pointer
-    }
-
     // Cleanup audio pipelines if they exist
     if (g_voice_pipeline)
     {
@@ -961,6 +730,17 @@ char *start_cam(char *device_path, int should_record, char *video_size, char *fr
     g_main_loop_unref(g_main_loop);
 
     endwin(); // End ncurses
+
+    if (g_srt_file)
+    {
+        fclose(g_srt_file);
+        g_srt_file = NULL;
+    }
+    if (g_csv_file)
+    {
+        fclose(g_csv_file);
+        g_csv_file = NULL;
+    }
 
     close_log_file();
 
@@ -1073,6 +853,43 @@ static char *setup_recording_branch(GstElement *tee)
                  "async", FALSE,
                  NULL);
 
+    /* Store recording folder and open markers.srt sidecar for writing */
+    snprintf(g_recording_folder, sizeof(g_recording_folder), "%s", foldername);
+    {
+        char markers_path[128];
+        snprintf(markers_path, sizeof(markers_path), "%s/markers.srt", foldername);
+        g_srt_file = fopen(markers_path, "a");
+        if (g_srt_file)
+        {
+            print_log("Opened markers file: %s\n", markers_path);
+        }
+        else
+        {
+            print_warning("Could not open markers.srt at %s\n", markers_path);
+        }
+
+        /* Also open CSV sidecar */
+        char csv_path[128];
+        snprintf(csv_path, sizeof(csv_path), "%s/markers.csv", foldername);
+        g_csv_file = fopen(csv_path, "a+");
+        if (g_csv_file)
+        {
+            /* If file was just created (size 0), write header */
+            fseek(g_csv_file, 0, SEEK_END);
+            long pos = ftell(g_csv_file);
+            if (pos == 0)
+            {
+                fprintf(g_csv_file, "time,label\n");
+                fflush(g_csv_file);
+            }
+            print_log("Opened CSV markers file: %s\n", csv_path);
+        }
+        else
+        {
+            print_warning("Could not open markers.csv at %s\n", csv_path);
+        }
+    }
+
     // Optional: mp4mux faststart if supported
     {
         GParamSpec *ps = g_object_class_find_property(G_OBJECT_GET_CLASS(video_muxer), "faststart");
@@ -1092,10 +909,6 @@ static char *setup_recording_branch(GstElement *tee)
         print_error("Failed to request tee record pad.\n");
         return "Failed to request tee record pad";
     }
-
-    // Attach a probe to the requested pad and store it globally for sync-marker pushes
-    gst_pad_add_probe(tee_record_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, video_pad_probe, NULL, NULL);
-    g_recording_src_pad = tee_record_pad;
 
     // Get the sink pad of the record queue
     queue_record_pad = gst_element_get_static_pad(record_queue, "sink");
@@ -1159,11 +972,6 @@ static void configure_audio_pipeline(
         print_error("Failed to create %s audio elements.\n", name);
         return;
     }
-
-    // Attach voice audio probe
-    // GstPad *source_pad = gst_element_request_pad_simple(src, "source_pad");
-    // gst_pad_add_probe(source_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, audio_pad_probe, NULL, NULL);
-    // gst_object_unref(source_pad);
 
     // Configure source queue to buffer audio and prevent blocking
     g_object_set(src_queue,
