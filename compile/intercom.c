@@ -2,6 +2,8 @@
 #include <signal.h>
 #include <gst/gst.h>
 #include <sys/stat.h>
+#include <ncurses.h>
+#include <pthread.h>
 
 static GMainLoop *g_main_loop = NULL;
 static GstElement *g_pipeline = NULL;
@@ -17,6 +19,110 @@ static void configure_audio_pipeline(const char *name, const char *client_name, 
 static char *setup_display_branch(GstElement *tee, GstElement *display_queue, GstElement *display_sink);
 static char *setup_recording_branch(GstElement *tee);
 
+static WINDOW *log_window;
+
+static void setup_log_window()
+{
+    int height = LINES - 5; // Leave space for other UI elements
+    int width = COLS;
+    int start_y = 0;
+    int start_x = 0;
+
+    log_window = newwin(height, width, start_y, start_x);
+    scrollok(log_window, TRUE); // Enable scrolling
+}
+
+static void print_log(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+
+    // Prefix the message with [LOG]
+    wprintw(log_window, "[LOG] ");
+    vw_printw(log_window, format, args);
+    wrefresh(log_window); // Refresh the log window to display the message
+
+    va_end(args);
+}
+
+static void print_warning(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+
+    // Prefix the message with [WARNING]
+    wprintw(log_window, "[WARNING] ");
+    vw_printw(log_window, format, args);
+    wrefresh(log_window); // Refresh the log window to display the message
+
+    va_end(args);
+}
+
+static void print_error(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+
+    // Prefix the message with [ERROR]
+    wprintw(log_window, "[ERROR] ");
+    vw_printw(log_window, format, args);
+    wrefresh(log_window); // Refresh the log window to display the message
+
+    va_end(args);
+}
+
+static void *ncurses_event_listener(void *arg)
+{
+    int ch;
+    while (1)
+    {
+        ch = getch();
+        if (ch != ERR)
+        {
+            switch (ch)
+            {
+            case KEY_UP:
+                print_log("Key pressed: UP\n");
+                break;
+            case 'q':
+                print_log("Key pressed: q (quit)\n");
+
+                raise(SIGTERM); // Send SIGTERM to exit the main loop
+                pthread_exit(NULL);
+            default:
+                print_log("Key pressed: %c\n", ch);
+                break;
+            }
+        }
+        g_usleep(10000); // Sleep for 10ms to reduce CPU usage
+    }
+    return NULL;
+}
+
+static char *setup_ncurses()
+{
+    // Initialize ncurses
+    initscr();
+    cbreak();
+    noecho();
+    curs_set(1);           // Show the cursor
+    nodelay(stdscr, TRUE); // Non-blocking input
+    keypad(stdscr, TRUE);
+
+    setup_log_window();
+
+    // Start a thread to listen for terminal events
+    pthread_t ncurses_thread;
+    if (pthread_create(&ncurses_thread, NULL, ncurses_event_listener, NULL) != 0)
+    {
+        g_printerr("Error: Failed to create ncurses event listener thread.\n");
+        endwin();
+        return "Failed to create ncurses thread";
+    }
+
+    return NULL;
+}
+
 static gboolean is_display_window_closed(const GError *err)
 {
     return err && err->message && g_strrstr(err->message, "window was closed") != NULL;
@@ -25,6 +131,8 @@ static gboolean is_display_window_closed(const GError *err)
 static void signal_handler(int signum)
 {
     g_print("\nReceived signal %d, cleaning up...\n", signum);
+
+    endwin(); // ncurses - Restore terminal to normal state
 
     if (g_main_loop)
     {
@@ -51,10 +159,7 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer data)
         }
         g_error_free(err);
         g_free(debug);
-        if (g_main_loop)
-        {
-            g_main_loop_quit(g_main_loop);
-        }
+        raise(SIGTERM); // Send SIGTERM to exit the main loop
         break;
     }
     case GST_MESSAGE_EOS:
@@ -75,9 +180,20 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer data)
 // video_size of the device to be set, passes /^\d+x\d+$/
 char *start_cam(char *device_path, int should_record, char *video_size)
 {
+    char *error;
+
+    {
+        // Setup window key events
+        error = setup_ncurses();
+        if (error != NULL)
+        {
+            g_print("Warning: Failed to setup ncurses: %s\n", error);
+            return error;
+        }
+    }
+
     GstElement *source, *capsfilter, *decoder, *convert, *tee, *display_queue, *display_sink;
     GstBus *bus;
-    char *error;
 
     // Initialize GStreamer
     gst_init(NULL, NULL);
@@ -198,8 +314,8 @@ char *start_cam(char *device_path, int should_record, char *video_size)
     g_print("Running webcam stream. Press Ctrl+C to stop.\n");
     g_main_loop_run(g_main_loop);
 
-    // Cleanup - send EOS to properly finalize recording
-    g_print("Cleaning up GStreamer pipelines...\n");
+    // Start Cleanup
+    g_print("Cleaning up...\n");
 
     // Destroy the mutex during cleanup
     g_mutex_clear(&g_sync_marker_mutex);

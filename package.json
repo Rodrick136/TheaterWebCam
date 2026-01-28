@@ -4,7 +4,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "compile": "gcc -shared -fPIC ./compile/intercom.c $(pkg-config --cflags --libs gstreamer-1.0) -o ./compile/libintercom.so"
+    "compile": "gcc -shared -fPIC ./compile/intercom.c $(pkg-config --cflags --libs gstreamer-1.0) -lncurses -o ./compile/libintercom.so"
   },
   "devDependencies": {
     "@types/bun": "latest"
