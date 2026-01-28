@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <signal.h>
 #include <gst/gst.h>
+#include <gst/gstbuffer.h>
 #include <sys/stat.h>
 #include <ncurses.h>
 #include <pthread.h>
@@ -674,7 +675,8 @@ static gboolean bus_callback(GstBus *bus, GstMessage *message, gpointer data)
 // device_path takes the form of /dev/video0
 // should_record is 1 to enable recording, 0 to disable
 // video_size of the device to be set, passes /^\d+x\d+$/
-char *start_cam(char *device_path, int should_record)
+// framerate is either "30" or "60", it will be a string
+char *start_cam(char *device_path, int should_record, char *video_size, char *framerate)
 {
     char *error;
 
@@ -698,6 +700,12 @@ char *start_cam(char *device_path, int should_record)
 
     // Initialize GStreamer
     gst_init(NULL, NULL);
+    // print_log("Initializing GStreamer...\n");
+    // gst_init(NULL, NULL);
+    // print_log("GStreamer initialized\n");
+    
+    // initialize GStreamer (previously logged for debugging)
+    gst_init(NULL, NULL);
 
     // Create the empty pipeline
     g_pipeline = gst_pipeline_new("webcam-pipeline");
@@ -708,6 +716,8 @@ char *start_cam(char *device_path, int should_record)
     tee = gst_element_factory_make("tee", "tee");
     display_queue = gst_element_factory_make("queue", "display_queue");
     display_sink = gst_element_factory_make("autovideosink", "display_sink");
+    // print_log("Creating pipeline elements...\n");
+    // print_log("Elements created: source=%p convert=%p tee=%p display_queue=%p display_sink=%p\n", source, convert, tee, display_queue, display_sink);
 
     decoder = gst_element_factory_make("jpegdec", "decoder");
     if (!decoder)
@@ -722,17 +732,14 @@ char *start_cam(char *device_path, int should_record)
         return "Failed to create GStreamer elements";
     }
 
-    // Attach video probe
-    // GstPad *tee_src_pad = gst_element_request_pad_simple(tee, "src_%u");
-    // gst_pad_add_probe(tee_src_pad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM, video_pad_probe, NULL, NULL);
-    // gst_object_unref(tee_src_pad);
-
     // Set the device property on the source
     g_object_set(source,
                  "device", device_path,
                  "do-timestamp", TRUE, // Use pipeline clock for timestamps
                  "io-mode", 2,         // Prefer MMAP for lower overhead if supported
                  NULL);
+    // print_log("Setting device property on source: %s\n", device_path);
+    // print_log("Device set on source\n");
 
     // Enable QoS so transforms can drop late frames
     g_object_set(convert,
@@ -746,13 +753,96 @@ char *start_cam(char *device_path, int should_record)
 
     // Add basic elements to pipeline
     gst_bin_add_many(GST_BIN(g_pipeline), source, decoder, convert, tee, display_queue, display_sink, NULL);
+    // print_log("Adding basic elements to pipeline\n");
+    // print_log("Added elements to pipeline\n");
 
-    // Link: source -> decoder -> convert -> tee
-    if (!gst_element_link_many(source, decoder, convert, tee, NULL))
+    // Try to negotiate caps using provided video_size and framerate
     {
-        print_error("Failed to link source -> decoder -> convert -> tee.\n");
-        gst_object_unref(g_pipeline);
-        return "Failed to link GStreamer elements";
+        int width = 0, height = 0, fr = 0;
+        GstCaps *caps = NULL;
+
+        if (video_size && sscanf(video_size, "%dx%d", &width, &height) != 2)
+        {
+            width = 0; height = 0;
+        }
+        if (framerate && sscanf(framerate, "%d", &fr) != 1)
+        {
+            fr = 0;
+        }
+
+        if (width > 0 && height > 0 && fr > 0)
+        {
+            char caps_str[128];
+            snprintf(caps_str, sizeof(caps_str), "image/jpeg, width=%d, height=%d, framerate=%d/1", width, height, fr);
+            print_log("Negotiating caps with camera: %s\n", caps_str);
+            caps = gst_caps_from_string(caps_str);
+            if (!caps)
+            {
+                print_warning("Failed to create caps from string '%s'\n", caps_str);
+            }
+        }
+
+        if (caps)
+        {
+            GstElement *capsfilter = gst_element_factory_make("capsfilter", "capsfilter");
+            // print_log("Created capsfilter ptr=%p\n", capsfilter);
+            if (!capsfilter)
+            {
+                print_warning("Failed to create capsfilter element; falling back to filtered-link fallback.\n");
+                if (!gst_element_link_filtered(source, decoder, caps))
+                {
+                    print_error("Failed to link source -> decoder with negotiated caps (no capsfilter available).\n");
+                    gst_caps_unref(caps);
+                    gst_object_unref(g_pipeline);
+                    return "Failed to link GStreamer elements with negotiated caps";
+                }
+                gst_caps_unref(caps);
+
+                if (!gst_element_link_many(decoder, convert, tee, NULL))
+                {
+                    print_error("Failed to link decoder -> convert -> tee.\n");
+                    gst_object_unref(g_pipeline);
+                    return "Failed to link GStreamer elements";
+                }
+            }
+            else
+            {
+                // print_log("Setting caps on capsfilter\n");
+                g_object_set(capsfilter, "caps", caps, NULL);
+                gst_caps_unref(caps);
+
+                /* Add capsfilter to the pipeline and link: source -> capsfilter -> decoder */
+                // print_log("Adding capsfilter to pipeline\n");
+                gst_bin_add(GST_BIN(g_pipeline), capsfilter);
+                // print_log("Linking source -> capsfilter -> decoder\n");
+                if (!gst_element_link_many(source, capsfilter, decoder, NULL))
+                {
+                    print_error("Failed to link source -> capsfilter -> decoder with negotiated caps.\n");
+                    gst_object_unref(g_pipeline);
+                    return "Failed to link GStreamer elements with capsfilter";
+                }
+                // print_log("Linked source -> capsfilter -> decoder OK\n");
+
+                /* Link remaining elements: decoder -> convert -> tee */
+                if (!gst_element_link_many(decoder, convert, tee, NULL))
+                {
+                    print_error("Failed to link decoder -> convert -> tee.\n");
+                    gst_object_unref(g_pipeline);
+                    return "Failed to link GStreamer elements";
+                }
+                // print_log("Linked decoder -> convert -> tee OK\n");
+            }
+        }
+        else
+        {
+            /* Fallback: no caps negotiation, link as before */
+            if (!gst_element_link_many(source, decoder, convert, tee, NULL))
+            {
+                print_error("Failed to link source -> decoder -> convert -> tee.\n");
+                gst_object_unref(g_pipeline);
+                return "Failed to link GStreamer elements";
+            }
+        }
     }
 
     // Setup display branch
