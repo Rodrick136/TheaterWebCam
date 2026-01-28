@@ -16,8 +16,11 @@ const { values, positionals } = parseArgs({
     },
     "video-size": {
       type: "string",
-      short: "v",
       default: "1920x1080",
+    },
+    framerate: {
+      type: "string",
+      default: "30",
     },
   },
   strict: true,
@@ -37,6 +40,12 @@ if (vs_regex.test(VIDEO_SIZE) === false) {
   console.log("Arg --video-size has to meet pattern /^\\d+x\\d+$/");
   process.exit(1);
 }
+const FRAMERATE = Number.parseInt(values.framerate, 10);
+// has to be 30 or 60
+if (FRAMERATE !== 30 && FRAMERATE !== 60) {
+  console.log("Arg --framerate has to be either 30 or 60");
+  process.exit(1);
+}
 
 console.log("Starting Webcam~");
 if (RECORD) {
@@ -46,10 +55,10 @@ if (RECORD) {
 const DEVICE = (
   await Bun.$`v4l2-ctl --list-devices | grep "Logitech BRIO" -A 1 | tail -n 1 | xargs`.text()
 ).trim();
-//configure the web cam settings
 console.log(`Selected cam device: ${DEVICE}`);
 console.log(`Video size: ${VIDEO_SIZE}`);
-Bun.$`v4l2-ctl -d ${DEVICE} --set-fmt-video=width=${VIDEO_SIZE.split("x")[0]},height=${VIDEO_SIZE.split("x")[1]},pixelformat=MJPG,framerate=60`;
+console.log(`Framerate: ${FRAMERATE}`);
+//configure the web cam settings
 //Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=white_balance_automatic=0`;
 //Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=white_balance_temperature=4500`;
 
@@ -72,14 +81,15 @@ const {
   symbols: { start_cam },
 } = dlopen("./compile/libintercom.so", {
   start_cam: {
-    args: ["cstring", "bool", "cstring"],
+    args: ["cstring", "bool", "cstring", "cstring"],
     returns: "ptr",
   },
 });
 
 const DEVICE_ptr = ptr(Buffer.from(DEVICE + "\0"));
 const VIDEO_SIZE_ptr = ptr(Buffer.from(VIDEO_SIZE + "\0"));
-const result_ptr = start_cam(DEVICE_ptr, RECORD, VIDEO_SIZE_ptr);
+const FRAMERATE_ptr = ptr(Buffer.from(FRAMERATE + "\0"));
+const result_ptr = start_cam(DEVICE_ptr, RECORD, VIDEO_SIZE_ptr, FRAMERATE_ptr);
 if (result_ptr) {
   const result = new CString(result_ptr).toString();
   console.error("Error:", result);
