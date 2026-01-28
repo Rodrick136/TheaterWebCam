@@ -234,6 +234,85 @@ static void print_element_properties(GstElement *element)
     }
 }
 
+static void trigger_sync_markers()
+{
+    g_mutex_lock(&g_sync_marker_mutex);
+
+    // Create a custom sync marker event
+    GstEvent *sync_marker_event = gst_event_new_custom(GST_EVENT_CUSTOM_DOWNSTREAM, gst_structure_new_empty("sync-marker"));
+
+    // Insert sync marker into the video pipeline
+    if (g_pipeline)
+    {
+        GstPad *video_sink_pad = gst_element_get_static_pad(g_pipeline, "sink");
+        if (video_sink_pad)
+        {
+            if (gst_pad_push_event(video_sink_pad, gst_event_ref(sync_marker_event)))
+            {
+                print_log("Inserted sync marker into video pipeline.\n");
+            }
+            else
+            {
+                print_warning("Failed to insert sync marker into video pipeline.\n");
+            }
+            gst_object_unref(video_sink_pad);
+        }
+        else
+        {
+            print_warning("Video pipeline sink pad not found.\n");
+        }
+    }
+
+    // Insert sync marker into the voice audio pipeline
+    if (g_voice_pipeline)
+    {
+        GstPad *voice_sink_pad = gst_element_get_static_pad(g_voice_pipeline, "sink");
+        if (voice_sink_pad)
+        {
+            if (gst_pad_push_event(voice_sink_pad, gst_event_ref(sync_marker_event)))
+            {
+                print_log("Inserted sync marker into voice audio pipeline.\n");
+            }
+            else
+            {
+                print_warning("Failed to insert sync marker into voice audio pipeline.\n");
+            }
+            gst_object_unref(voice_sink_pad);
+        }
+        else
+        {
+            print_warning("Voice audio pipeline sink pad not found.\n");
+        }
+    }
+
+    // Insert sync marker into the effects audio pipeline
+    if (g_fx_pipeline)
+    {
+        GstPad *fx_sink_pad = gst_element_get_static_pad(g_fx_pipeline, "sink");
+        if (fx_sink_pad)
+        {
+            if (gst_pad_push_event(fx_sink_pad, gst_event_ref(sync_marker_event)))
+            {
+                print_log("Inserted sync marker into effects audio pipeline.\n");
+            }
+            else
+            {
+                print_warning("Failed to insert sync marker into effects audio pipeline.\n");
+            }
+            gst_object_unref(fx_sink_pad);
+        }
+        else
+        {
+            print_warning("Effects audio pipeline sink pad not found.\n");
+        }
+    }
+
+    // Unref the sync marker event
+    gst_event_unref(sync_marker_event);
+
+    g_mutex_unlock(&g_sync_marker_mutex);
+}
+
 static void *ncurses_event_listener(void *arg)
 {
     int ch;
@@ -245,7 +324,8 @@ static void *ncurses_event_listener(void *arg)
             switch (ch)
             {
             case 'm':
-                print_log("[KEY] m (make markers)\n");
+                print_log("[KEY] m (make sync markers)\n");
+                trigger_sync_markers();
                 break;
             case 'q':
                 print_log("[KEY] q (quit)\n");
