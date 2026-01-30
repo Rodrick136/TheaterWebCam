@@ -68,12 +68,14 @@ Usage: bun index.ts [options]
 Options:
   -h, --help                          Show this help message
   -r, --record                        Enable recording mode
-  -f, --focus <value>                 Set focus value (integer)
+  -f, --focus <integer>               Set focus value (disables auto-focus)
       --video-size <WxH>              Set video size (default: 1920x1080)
+        ~ List with v4l2-ctl --list-formats-ext -d <device> ~
       --framerate <30|60>             Set framerate (default: 30)
       --effects-device-l <dev>:<port> Link left effects audio device port
       --effects-device-r <dev>:<port> Link right effects audio device port
       --voice-device <dev>:<port>     Link voice audio device port
+        ~ <dev>:<port> can be found with 'pw-link -lm' ~
       --hardware-acceleration         Enable hardware acceleration (VAAPI) - WIP
 
 Example:
