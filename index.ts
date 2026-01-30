@@ -122,8 +122,8 @@ if (RECORD) {
   // 1. Add a small latency to the muxer so it doesn't choke waiting for audio
   "matroskamux",
     "name=mux",
-    "offset-to-zero=true",
-    "latency=200000000",
+    //"offset-to-zero=true",
+    //"latency=200000000",
     "!",
   "filesink",
     `location=./${DIR_NAME}/webcam_full.mkv`,
@@ -147,6 +147,8 @@ if (RECORD) {
     "!",
   `video/x-raw,framerate=${FRAMERATE}/1`, // IMPORTANT: Force the framerate to be stable before the tee
     "!",
+  "videoconvert",
+    "!",
   "tee",
     "name=t",
     // --- VIDEO BRANCHES ---
@@ -162,7 +164,7 @@ if (RECORD) {
       // "async=false", no such thing for sink
 
     // Branch 2: Recording
-    "t.",
+    /* "t.",
       "!",
     "queue",
       "max-size-buffers=300",
@@ -174,7 +176,7 @@ if (RECORD) {
       "!", 
     "h264parse",
       "!",
-    "mux.video_0",
+    "mux.video_0", */
 
   // --- VOICE AUDIO ---
   "pipewiresrc",
