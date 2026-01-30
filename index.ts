@@ -1,6 +1,24 @@
 import { mkdirSync } from "node:fs";
 import { parseArgs } from "node:util";
 
+// make sure we have the right commands available
+const v4l2_check =(await Bun.$`which v4l2-ctl`.text()).trim();
+if (v4l2_check.startsWith("which") === true) {
+  console.error("v4l2-ctl command not found. Please install v4l2-ctl.");
+  process.exit(1);
+}
+const gst_check = (await Bun.$`which gst-launch-1.0`.text()).trim();
+if (gst_check.startsWith("which") === true) {
+  console.error("gst-launch-1.0 command not found. Please install GStreamer.");
+  process.exit(1);
+}
+const pw_record_check = (await Bun.$`which pw-record`.text()).trim();
+if (pw_record_check.startsWith("which") === true) {
+  console.error("pw-record command not found. Please install PipeWire.");
+  process.exit(1);
+}
+
+
 // Parse command-line arguments
 const { values, positionals } = parseArgs({
   args: Bun.argv,
