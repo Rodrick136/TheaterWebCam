@@ -16,6 +16,13 @@ static GstElement *g_pipeline = NULL;
 static GstElement *g_voice_pipeline = NULL; // Separate pipeline for voice audio
 static GstElement *g_fx_pipeline = NULL;    // Separate pipeline for effects audio
 
+/* Keep references to the tee element and requested pads so we can
+ * send EOS directly to the record branch and release pads on cleanup.
+ */
+static GstElement *g_tee_element = NULL;
+static GstPad *g_tee_record_pad = NULL;
+static GstPad *g_tee_display_pad = NULL;
+
 static GMutex g_sync_marker_mutex; // Mutex for thread-safe access to sync marker
 
 // Forward declarations
@@ -496,6 +503,7 @@ char *start_cam(char *dir_name, char *device_path, int should_record, char *vide
     source = gst_element_factory_make("v4l2src", "source");
     convert = gst_element_factory_make("videoconvert", "convert");
     tee = gst_element_factory_make("tee", "tee");
+    g_tee_element = tee;
     display_queue = gst_element_factory_make("queue", "display_queue");
     display_sink = gst_element_factory_make("autovideosink", "display_sink");
     // print_log("Creating pipeline elements...\n");
@@ -677,6 +685,21 @@ char *start_cam(char *dir_name, char *device_path, int should_record, char *vide
     // Destroy the mutex during cleanup
     g_mutex_clear(&g_sync_marker_mutex);
 
+    /* Try to send EOS directly to the recording branch pad peer so the
+     * muxer/filesink receives EOS even if the tee/pad routing would
+     * otherwise impede propagation. This helps ensure files are finalized.
+     */
+    if (g_tee_record_pad)
+    {
+        GstPad *peer = gst_pad_get_peer(g_tee_record_pad);
+        if (peer)
+        {
+            print_log("Sending EOS directly to record branch pad peer\n");
+            gst_pad_send_event(peer, gst_event_new_eos());
+            gst_object_unref(peer);
+        }
+    }
+
     // Send end-of-stream event to video pipeline to finalize files
     gst_element_send_event(g_pipeline, gst_event_new_eos());
 
@@ -697,6 +720,24 @@ char *start_cam(char *dir_name, char *device_path, int should_record, char *vide
         gst_element_set_state(g_pipeline, GST_STATE_NULL);
         gst_object_unref(g_pipeline);
         g_pipeline = NULL; // Avoid dangling pointer
+    }
+
+    /* Release any requested tee pads and unref them to avoid leaks */
+    if (g_tee_element)
+    {
+        if (g_tee_record_pad)
+        {
+            gst_element_release_request_pad(g_tee_element, g_tee_record_pad);
+            gst_object_unref(g_tee_record_pad);
+            g_tee_record_pad = NULL;
+        }
+        if (g_tee_display_pad)
+        {
+            gst_element_release_request_pad(g_tee_element, g_tee_display_pad);
+            gst_object_unref(g_tee_display_pad);
+            g_tee_display_pad = NULL;
+        }
+        g_tee_element = NULL;
     }
 
     // Cleanup audio pipelines if they exist
@@ -756,7 +797,7 @@ char *start_cam(char *dir_name, char *device_path, int should_record, char *vide
 
 static char *setup_display_branch(GstElement *tee, GstElement *display_queue, GstElement *display_sink)
 {
-    GstPad *tee_display_pad, *queue_display_pad;
+    GstPad *queue_display_pad;
 
     // Configure display queue for minimal latency
     g_object_set(display_queue,
@@ -772,9 +813,11 @@ static char *setup_display_branch(GstElement *tee, GstElement *display_queue, Gs
                  NULL);
 
     // Link display branch: tee -> display_queue -> display_sink
-    tee_display_pad = gst_element_request_pad_simple(tee, "src_%u");
+    /* Request a pad from the tee and remember it globally so we can
+     * send events/release it later. */
+    g_tee_display_pad = gst_element_request_pad_simple(tee, "src_%u");
     queue_display_pad = gst_element_get_static_pad(display_queue, "sink");
-    if (gst_pad_link(tee_display_pad, queue_display_pad) != GST_PAD_LINK_OK)
+    if (gst_pad_link(g_tee_display_pad, queue_display_pad) != GST_PAD_LINK_OK)
     {
         print_error("Failed to link tee to display queue.\n");
         gst_object_unref(queue_display_pad);
@@ -794,7 +837,7 @@ static char *setup_display_branch(GstElement *tee, GstElement *display_queue, Gs
 static char *setup_recording_branch(GstElement *tee)
 {
     GstElement *record_queue, *encoder, *muxer_queue, *video_muxer, *video_file_sink;
-    GstPad *tee_record_pad, *queue_record_pad;
+    GstPad *queue_record_pad;
 
     print_log("Recording enabled - video: webcam_video.mp4\n");
 
@@ -917,8 +960,9 @@ static char *setup_recording_branch(GstElement *tee)
     gst_bin_add_many(GST_BIN(g_pipeline), record_queue, encoder, muxer_queue, video_muxer, video_file_sink, NULL);
 
     // Request a single new pad from the tee element for recording and attach probe to it
-    tee_record_pad = gst_element_request_pad_simple(tee, "src_%u");
-    if (!tee_record_pad || !GST_IS_PAD(tee_record_pad))
+    /* Request a pad from the tee for recording and store it globally */
+    g_tee_record_pad = gst_element_request_pad_simple(tee, "src_%u");
+    if (!g_tee_record_pad || !GST_IS_PAD(g_tee_record_pad))
     {
         print_error("Failed to request tee record pad.\n");
         return "Failed to request tee record pad";
@@ -929,15 +973,15 @@ static char *setup_recording_branch(GstElement *tee)
     if (!queue_record_pad)
     {
         print_error("Failed to get record queue sink pad.\n");
-        gst_object_unref(tee_record_pad);
+        gst_object_unref(g_tee_record_pad);
         return "Failed to get record queue sink pad";
     }
 
     // Link the tee pad to the record queue pad
-    if (gst_pad_link(tee_record_pad, queue_record_pad) != GST_PAD_LINK_OK)
+    if (gst_pad_link(g_tee_record_pad, queue_record_pad) != GST_PAD_LINK_OK)
     {
         print_error("Failed to link tee to record queue.\n");
-        gst_object_unref(tee_record_pad);
+        gst_object_unref(g_tee_record_pad);
         gst_object_unref(queue_record_pad);
         return "Failed to link record branch";
     }

@@ -3,10 +3,7 @@
   "module": "index.ts",
   "type": "module",
   "private": true,
-  "scripts": {
-    "compile": "gcc -shared -fPIC ./compile/intercom.c $(pkg-config --cflags --libs gstreamer-1.0) -lncurses -o ./compile/libintercom.so",
-    "test": "gcc ./compile/intercom.c -o intercom     $(pkg-config --cflags --libs gstreamer-1.0)     -lncurses -lpthread -o ./compile/sa_intercom"
-  },
+  "scripts": {},
   "devDependencies": {
     "@types/bun": "latest"
   },
