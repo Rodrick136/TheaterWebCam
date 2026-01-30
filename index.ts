@@ -152,18 +152,20 @@ if (RECORD) {
 
   try {
     _videoProc = Bun.spawn({
+      env: {
+        ...process.env,
+        GST_DEBUG: "3",
+      },
       cmd: [
         "gst-launch-1.0",
+        "-e",
         "-v",
         "v4l2src",
         `device=${DEVICE}`,
         "do-timestamp=true",
         "io-mode=2",
         "!",
-        "image/jpeg,",
-        `width=${WIDTH},`,
-        `height=${HEIGHT},`,
-        `framerate=${FRAMERATE}/1`,
+        `image/jpeg,width=${WIDTH},height=${HEIGHT},framerate=${FRAMERATE}/1`,
         "!",
         "jpegdec",
         "!",
@@ -199,16 +201,16 @@ if (RECORD) {
         "qp-min=10",
         //"tune=film",
         "!",
+        "h264parse",
+        "!",
         "queue",
         "max-size-buffers=300",
         "leaky=2",
         "!",
-        "mp4mux",
-        "faststart=true",
-        "!",
+        "matroskamux",
+        "!", 
         "filesink",
-        `location=./${DIR_NAME}/webcam_video.mp4`,
-        "async=false",
+        `location=${DIR_NAME}/webcam_video.mkv`,
       ],
       stdout: "inherit",
       stdin: "pipe",
@@ -229,10 +231,7 @@ if (RECORD) {
         "do-timestamp=true",
         "io-mode=2",
         "!",
-        "image/jpeg,",
-        `width=${WIDTH},`,
-        `height=${HEIGHT},`,
-        `framerate=${FRAMERATE}/1`,
+        `image/jpeg,width=${WIDTH},height=${HEIGHT},framerate=${FRAMERATE}/1`,
         "!",
         "jpegdec",
         "!",
@@ -269,12 +268,28 @@ const waitFor = async (p: Promise<number>, ms: number) => {
 // Kill a subprocess gracefully: send SIGINT, wait, then SIGTERM if still alive
 const killAndAwait = async (proc: Bun.Subprocess | null) => {
   if (!proc) return;
-  proc.kill("SIGINT");
-  const finished = await waitFor(proc.exited, 3000);
+  try {
+    proc.kill("SIGINT");
+  } catch (e) {}
+  // Also send SIGINT to the child process group so gst-launch and its
+  // children receive it and can flush/emit EOS to finalize files.
+  try {
+    const pid = (proc as any).pid as number | undefined;
+    if (typeof pid === "number" && pid > 0) {
+      try {
+        process.kill(-pid, "SIGINT");
+      } catch (e) {}
+    }
+  } catch (e) {}
+
+  // Give longer time for gst pipeline to flush and mp4mux to finalize
+  const finished = await waitFor(proc.exited, 8000);
   if (!finished) {
-    proc.kill("SIGTERM");
+    try {
+      proc.kill("SIGTERM");
+    } catch (e) {}
     // give it a bit more time to terminate
-    await waitFor(proc.exited, 2000);
+    await waitFor(proc.exited, 3000);
   }
 };
 
