@@ -22,6 +22,11 @@ if (pw_record_check.startsWith("which") === true) {
 const { values, positionals } = parseArgs({
   args: Bun.argv,
   options: {
+    help: {
+      type: "boolean",
+      short: "h",
+      default: false,
+    },
     record: {
       type: "boolean",
       short: "r",
@@ -39,6 +44,15 @@ const { values, positionals } = parseArgs({
       type: "string",
       default: "30",
     },
+    "effects-device-l": {
+      type: "string",
+    },
+    "effects-device-r": {
+      type: "string",
+    },
+    "voice-device": {
+      type: "string",
+    },
     "hardware-acceleration": {
       type: "boolean",
       default: false,
@@ -47,6 +61,28 @@ const { values, positionals } = parseArgs({
   strict: true,
   allowPositionals: true,
 });
+if (values.help) {
+  console.log(`
+Usage: bun index.ts [options]
+
+Options:
+  -h, --help                          Show this help message
+  -r, --record                        Enable recording mode
+  -f, --focus <value>                 Set focus value (integer)
+      --video-size <WxH>              Set video size (default: 1920x1080)
+      --framerate <30|60>             Set framerate (default: 30)
+      --effects-device-l <dev>:<port> Link left effects audio device port
+      --effects-device-r <dev>:<port> Link right effects audio device port
+      --voice-device <dev>:<port>     Link voice audio device port
+      --hardware-acceleration         Enable hardware acceleration (VAAPI) - WIP
+
+Example:
+  bun index.ts --record --focus 20 --video-size 1280x720 --framerate 60
+`);
+  process.exit(0);
+}
+
+
 const RECORD = values.record;
 
 const FOCUS = values.focus ? Number.parseInt(values.focus) : undefined;
@@ -160,6 +196,7 @@ if (RECORD) {
     // create a virtual audio sink with 3 channels
     const sink_name = "TheaterWebcam-AUDIO_SINK";
     {
+      console.log("use pw-link -lm to list sources and sinks as their connections are made");
       const json_string = (
         await Bun.$`pactl -f json load-module module-null-sink sink_name=${sink_name} channels=3 channel_map=mono,left,right`.text()
       ).trim();
@@ -168,12 +205,21 @@ if (RECORD) {
       console.log(`Created virtual audio sink with module ID:`, sink_name, audioModule);
 
       // connect sink_name to default capture source
-      const default_source = default_sources[0];
-      if (default_source) {
+      if (values["effects-device-l"] && values["effects-device-r"]) {
+        await Bun.$`pw-link ${values["effects-device-l"]} ${sink_name}:playback_FL`;
+        await Bun.$`pw-link ${values["effects-device-r"]} ${sink_name}:playback_FR`;
+        console.log(`Connected effects devices to virtual audio sink`);
+      } else if (default_sources[0]) {
+        const default_source = default_sources[0];
         await Bun.$`pw-link ${default_source.node_name}:capture_FL ${sink_name}:playback_FL`;
         await Bun.$`pw-link ${default_source.node_name}:capture_FR ${sink_name}:playback_FR`;
         console.log(`Connected default capture to virtual audio sink`);
       }
+      if (values["voice-device"]) {
+        await Bun.$`pw-link ${values["voice-device"]} ${sink_name}:playback_M`;
+        console.log(`Connected voice device to virtual audio sink`);
+      }
+
     }
 
     // prettier-ignore
