@@ -39,6 +39,10 @@ const { values, positionals } = parseArgs({
       type: "string",
       default: "30",
     },
+    "hardware-acceleration": {
+      type: "boolean",
+      default: false,
+    },
   },
   strict: true,
   allowPositionals: true,
@@ -68,14 +72,16 @@ if (FRAMERATE !== 30 && FRAMERATE !== 60) {
   process.exit(1);
 }
 
+const HARDWARE_ACCELERATION = values["hardware-acceleration"];
+
 console.log("Starting Webcam~");
 if (RECORD) {
   console.log("Recording mode enabled");
 }
 
 const v4l2_DEVICE = (
-    await Bun.$`v4l2-ctl --list-devices | grep "Logitech BRIO" -A 1 | tail -n 1 | xargs`.text()
-  ).trim();
+  await Bun.$`v4l2-ctl --list-devices | grep "Logitech BRIO" -A 1 | tail -n 1 | xargs`.text()
+).trim();
 const devices = JSON.parse((await Bun.$`pw-dump`.text()).trim());
 const webcams = [];
 for (const device of devices) {
@@ -109,145 +115,204 @@ if (RECORD) {
   mkdirSync(DIR_NAME);
 }
 
+const hasVaapi = async () => {
+  if (HARDWARE_ACCELERATION === false) {
+    return false;
+  }
+  try {
+    const p = Bun.spawn({
+      cmd: ["gst-inspect-1.0", "vaapijpegdec"],
+      stdout: "pipe",
+      stdin: "pipe",
+      stderr: "pipe",
+    });
+    await p.exited;
+    const text = await p.stdout.text();
+
+    return text.startsWith("No such element or plugin") === false;
+  } catch {
+    return false;
+  }
+};
+
+const vaapiAvailable = await hasVaapi();
+if (vaapiAvailable) {
+  console.log("Pipeline: using VAAPI hardware acceleration for display");
+} else {
+  console.log("Pipeline: using CPU pipeline");
+}
+
 let _videoProc: Bun.Subprocess<"pipe", "inherit", "inherit"> | null = null;
+let _audioProc: Bun.Subprocess<"pipe", "inherit", "inherit"> | null = null;
+let audioModule: string | null = null;
 if (RECORD) {
   try {
+    // create a virtual audio sink with 3 channels
+    audioModule = (
+      await Bun.$`pactl load-module module-null-sink sink_name=virtual3 channels=3 channel_map=front-left,front-right,front-center`.text()
+    ).trim();
+
+    const props = [
+      "stream-properties=props",
+      "media.name=AUDIO",
+      "media.role=Production",
+      "node.always-process=true",
+    ].join(",");
+    console.log("Audio PipeWire source properties:", props);
+
+    // prettier-ignore
+    const vaapiCmd = [
+      "gst-launch-1.0", "-v", "-e",
+      "v4l2src", `device=${v4l2_DEVICE}`, "!",
+      `image/jpeg,width=${WIDTH},height=${HEIGHT},framerate=${FRAMERATE}/1`, "!",
+      "queue", "leaky=downstream", "max-size-buffers=2", "!",
+      "jpegparse", "!", 
+      "vaapijpegdec", "!",
+      "vaapipostproc", "!",
+      "tee", "name=t", 
+      // Display branch for video
+      "t.", "!",
+      "queue", "leaky=downstream", "!",
+      "vaapisink", "sync=false",
+      // Second display branch (opens another window)
+      "t.", "!",
+      "queue", "leaky=downstream", "!",
+      "vaapisink", "sync=false",
+      // Recording branch for video
+      "t.", "!",
+      "queue", "max-size-buffers=300", "!",
+
+      "x264enc", "speed-preset=ultrafast", "tune=zerolatency", "bitrate=8192", "!",
+      "h264parse", "!",
+      "mux.video_0",
+
+      "pipewiresrc", props, "target-object=virtual3", "!",
+      "audio/x-raw,channels=3", "!",
+      "queue", "leaky=downstream", "max-size-time=3000000000", "max-size-buffers=0", "!",
+      "audioconvert", "!", 
+      "audioresample", "!",
+      "mux.audio_0",
+
+      "matroskamux", "name=mux", "!",
+      "filesink", `location=./${DIR_NAME}/webcam_full.mkv`,
+    ];
+
+    // prettier-ignore
+    const cpuCmd = [
+      "gst-launch-1.0", "-v", "-e",
+      "v4l2src", `device=${v4l2_DEVICE}`, "!",
+      `image/jpeg,width=${WIDTH},height=${HEIGHT},framerate=${FRAMERATE}/1`, "!",
+      "queue", "leaky=downstream", "max-size-buffers=2", "!",
+      "jpegdec", "!",
+      "tee", "name=t", "t.", "!",
+      "queue", "leaky=downstream", "!",
+      "autovideosink", "sync=false",
+      // Second display branch (opens another window)
+      "t.", "!",
+      "queue", "leaky=downstream", "!",
+      "autovideosink", "sync=false",
+      // Recording branch for video
+      "t.", "!",
+      "queue", "max-size-buffers=300", "!",
+      "x264enc", "speed-preset=ultrafast", "tune=zerolatency", "bitrate=8192", "!",
+      "h264parse", "!",
+      "mux.video_0",
+
+      "pulsesrc", `client-name=TheaterWebcam-AUDIO`, "device=virtual3.monitor", "!",
+      "audio/x-raw,channels=3", "!",
+      "queue", "leaky=downstream", "max-size-time=3000000000", "max-size-buffers=0", "!",
+      "audioconvert", "!", 
+      "audioresample", "!",
+      "mux.audio_0",
+
+      "matroskamux", "name=mux", "!",
+      "filesink", `location=./${DIR_NAME}/webcam_full.mkv`,
+    ];
+
     _videoProc = Bun.spawn({
-      env: {
-        ...process.env,
-        GST_DEBUG: "3",
-      },
-      cmd: [
-  "gst-launch-1.0", "-v", "-e",
-  // 1. Add a small latency to the muxer so it doesn't choke waiting for audio
-  "matroskamux",
-    "name=mux",
-    //"offset-to-zero=true",
-    //"latency=200000000",
-    "!",
-  "filesink",
-    `location=./${DIR_NAME}/webcam_full.mkv`,
-    //"async=false",
-
-  // --- VIDEO SOURCE ---
-  "pipewiresrc",
-    `target-object=${DEVICE}`,
-    "do-timestamp=true",
-    "!",
-  `image/jpeg,width=${WIDTH},height=${HEIGHT},framerate=${FRAMERATE}/1`,
-    "!",
-  "queue",
-    "leaky=downstream",
-    "max-size-buffers=2",
-    "!",
-  "jpegdec", "!",
-  "videorate",
-    //"drop-only=true",
-    "skip-to-first=true",
-    "!",
-  `video/x-raw,framerate=${FRAMERATE}/1`, // IMPORTANT: Force the framerate to be stable before the tee
-    "!",
-  "videoconvert",
-    "!",
-  "tee",
-    "name=t",
-    // --- VIDEO BRANCHES ---
-
-    // Branch 1: Preview (queue is mandatory here to unblock the tee)
-    "t.",
-      "!",
-    "queue",
-      "leaky=downstream",
-      "!", 
-    "autovideosink",
-      "sync=false",
-      // "async=false", no such thing for sink
-
-    // Branch 2: Recording
-    /* "t.",
-      "!",
-    "queue",
-      "max-size-buffers=300",
-      "!", 
-    "x264enc",
-      "speed-preset=ultrafast",
-      "tune=zerolatency",
-      "bitrate=8192",
-      "!", 
-    "h264parse",
-      "!",
-    "mux.video_0", */
-
-  // --- VOICE AUDIO ---
-  "pipewiresrc",
-    "client-name=TheaterWebCam",
-    "stream-properties=props,media.name=voice",
-    "do-timestamp=true",
-    "!",
-  "audio/x-raw,channels=1,rate=48000", // <--- CAPS FORCE MONO
-    "!", 
-  "queue",
-    "leaky=2",
-    "max-size-time=3000000000",
-    "max-size-buffers=0",
-    "!",
-  "audioconvert", // convert to raw audio
-    "!", 
-  "audioresample", // resample if needed
-    "!",
-  "mux.audio_0", // end branch by connecting to muxer
-
-  // --- EFFECTS AUDIO ---
-  "pipewiresrc",
-    "client-name=TheaterWebCam",
-    "stream-properties=props,media.name=effects",
-    "do-timestamp=true",
-    "!",
-  "audio/x-raw,channels=2,rate=48000", // <--- CAPS FORCE MONO
-    "!", 
-  "queue",
-    "leaky=2",
-    "max-size-time=3000000000",
-    "max-size-buffers=0",
-    "!",
-  "audioconvert", // convert to raw audio
-    "!", 
-  "audioresample", // resample if needed
-    "!",
-  "mux.audio_1", // end branch by connecting to muxer
-],
+      cmd: vaapiAvailable ? vaapiCmd : cpuCmd,
       stdout: "inherit",
       stdin: "pipe",
       stderr: "inherit",
     });
   } catch (e) {
-    console.error("Failed to start effects recorder:", e);
+    console.error("Failed to start video recorder:", e);
   }
+
+  /* 
+  try {
+    // Audio subprocess: capture voice into an MP3 file (replace matroskamux)
+    // This encodes audio to MP3 directly and writes audio.mp3.
+    _audioProc = Bun.spawn({
+      // prettier-ignore
+      cmd: [
+        "pw-record",
+        "--target=0",
+        "--media-category=Capture",
+        "--properties=media.name=AUDIO",
+        "--channels=3",
+        "--rate=48000",
+        `./${DIR_NAME}/audio.wav`
+      ],
+      stdout: "inherit",
+      stdin: "pipe",
+      stderr: "inherit",
+    });
+  } catch (e) {
+    console.error("Failed to start audio recorder:", e);
+  } */
 } else {
   // just play the video without recording
   try {
+    const vaapiViewCmd = [
+      "gst-launch-1.0", "-v", "-e",
+      "v4l2src", `device=${v4l2_DEVICE}`, "!",
+      `image/jpeg,width=${WIDTH},height=${HEIGHT},framerate=${FRAMERATE}/1`, "!",
+      "queue", "leaky=downstream", "max-size-buffers=2", "!",
+      "jpegparse", "!", 
+      "vaapijpegdec", "!",
+      "vaapipostproc", "!",
+      // split to two display branches
+      "tee", "name=t", 
+      "t.", "!",
+      "queue", "leaky=downstream", "!",
+      "vaapisink", "sync=false",
+      "t.", "!",
+      "queue", "leaky=downstream", "!",
+      "autovideosink", "sync=false",
+    ];
+
+    const cpuViewCmd = [
+      "gst-launch-1.0",
+      "v4l2src", `device=${v4l2_DEVICE}`, "!",
+      `image/jpeg,width=${WIDTH},height=${HEIGHT},framerate=${FRAMERATE}/1`,
+      "!",
+      "jpegdec",
+      "!",
+      // split to two display branches
+      "tee", "name=t", 
+      "t.", "!",
+      "queue",
+      "max-size-buffers=2",
+      "max-size-bytes=0",
+      "max-size-time=0",
+      "leaky=downstream",
+      "!",
+      "autovideosink",
+      "sync=false",
+      "t.", "!",
+      "queue",
+      "max-size-buffers=2",
+      "max-size-bytes=0",
+      "max-size-time=0",
+      "leaky=downstream",
+      "!",
+      "autovideosink",
+      "sync=false",
+    ];
+
     _videoProc = Bun.spawn({
-      cmd: [
-        "gst-launch-1.0",
-        "v4l2src",
-        `device=${DEVICE}`,
-        "!",
-        `image/jpeg,width=${WIDTH},height=${HEIGHT},framerate=${FRAMERATE}/1`,
-        "!",
-        "jpegdec",
-        "!",
-        "videoconvert",
-        "qos=true",
-        "!",
-        "queue",
-        "max-size-buffers=2",
-        "max-size-bytes=0",
-        "max-size-time=0",
-        "leaky=downstream",
-        "!",
-        "autovideosink",
-        "sync=false",
-      ],
+      cmd: vaapiAvailable ? vaapiViewCmd : cpuViewCmd,
       stdout: "inherit",
       stdin: "pipe",
       stderr: "inherit",
@@ -260,11 +325,35 @@ if (RECORD) {
 const exit = async () => {
   console.log("Exiting, stopping subprocesses...");
   if (_videoProc) {
-    console.log("Stopping video process...");
-    _videoProc.kill("SIGINT");
-    await _videoProc.exited;
-    console.log("Video process stopped.");
+    try {
+      console.log("Stopping video process...");
+      _videoProc.kill("SIGINT");
+      await _videoProc.exited;
+      console.log("Video process stopped.");
+    } catch (e) {
+      console.warn("Error stopping video process:", e);
+    }
   }
+  // cleanup the virtual audio sink
+  if (audioModule) {
+    try {
+      console.log("Unloading virtual audio sink...");
+      await Bun.$`pactl unload-module ${audioModule}`;
+      console.log("Virtual audio sink unloaded.");
+    } catch (e) {
+      console.warn("Error unloading virtual audio sink:", e);
+    }
+  }
+  /* if (_audioProc) {
+    try {
+      console.log("Stopping audio process...");
+      _audioProc.kill("SIGINT");
+      await _audioProc.exited;
+      console.log("Audio process stopped.");
+    } catch (e) {
+      console.warn("Error stopping audio process:", e);
+    }
+  } */
   console.log("All subprocesses stopped.");
 };
 
