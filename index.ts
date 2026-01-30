@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { parseArgs } from "node:util";
 
 // make sure we have the right commands available
-const v4l2_check =(await Bun.$`which v4l2-ctl`.text()).trim();
+const v4l2_check = (await Bun.$`which v4l2-ctl`.text()).trim();
 if (v4l2_check.startsWith("which") === true) {
   console.error("v4l2-ctl command not found. Please install v4l2-ctl.");
   process.exit(1);
@@ -17,7 +17,6 @@ if (pw_record_check.startsWith("which") === true) {
   console.error("pw-record command not found. Please install PipeWire.");
   process.exit(1);
 }
-
 
 // Parse command-line arguments
 const { values, positionals } = parseArgs({
@@ -74,29 +73,34 @@ if (RECORD) {
   console.log("Recording mode enabled");
 }
 
-const DEVICE = (
-  await Bun.$`v4l2-ctl --list-devices | grep "Logitech BRIO" -A 1 | tail -n 1 | xargs`.text()
-).trim();
-console.log(`Selected cam device: ${DEVICE}`);
+const v4l2_DEVICE = (
+    await Bun.$`v4l2-ctl --list-devices | grep "Logitech BRIO" -A 1 | tail -n 1 | xargs`.text()
+  ).trim();
+const devices = JSON.parse((await Bun.$`pw-dump`.text()).trim());
+const webcams = [];
+for (const device of devices) {
+  if (device.type === "PipeWire:Interface:Node") {
+    const props = device.info.props;
+    if (props["object.path"] === `v4l2:${v4l2_DEVICE}`) {
+      //console.log("Found webcam:", props);
+      webcams.push({
+        id: device.id,
+        description: props["node.description"],
+        node_name: props["node.name"],
+      });
+    }
+  }
+}
+if (webcams.length === 0) {
+  console.error("No webcams found. Please connect a webcam.");
+  process.exit(1);
+}
+//console.log("Available webcams:", webcams);
+const DEVICE = webcams[0]!.node_name as string;
+
+console.log(`Selected cam device: ${webcams[0]?.description} (${DEVICE})`);
 console.log(`Video size: ${VIDEO_SIZE}`);
 console.log(`Framerate: ${FRAMERATE}`);
-//configure the web cam settings
-//Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=white_balance_automatic=0`;
-//Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=white_balance_temperature=4500`;
-
-await Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=auto_exposure=1`;
-await Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=exposure_time_absolute=400`;
-await Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=gain=0`;
-await Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=backlight_compensation=0`;
-await Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=zoom_absolute=300`;
-
-if (FOCUS !== undefined) {
-  console.log(`Focus set to: ${FOCUS}`);
-  await Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=focus_automatic_continuous=0`;
-  await Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=focus_absolute=${FOCUS}`;
-}
-//Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=pan_absolute=3600`;
-//Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=tilt_absolute=3600`;
 
 // Recording folder name
 const DIR_NAME = `Recording__${new Date().toISOString()}`;
@@ -105,51 +109,8 @@ if (RECORD) {
   mkdirSync(DIR_NAME);
 }
 
-// start recording audio here
-let _voiceProc: Bun.Subprocess | null = null;
-let _effectsProc: Bun.Subprocess | null = null;
 let _videoProc: Bun.Subprocess<"pipe", "inherit", "inherit"> | null = null;
 if (RECORD) {
-  const voicePath = `${DIR_NAME}/webcam_voice.wav`;
-  const effectsPath = `${DIR_NAME}/webcam_effects.wav`;
-
-  // spawn pw-record processes (run until terminated)
-  try {
-    _voiceProc = Bun.spawn({
-      cmd: [
-        "pw-record",
-        "--channels=1",
-        "--rate=48000",
-        "--properties",
-        `media.name=webcam_voice,node.name=webcam_voice,application.name=TheaterWebCam-Voice`,
-        voicePath,
-      ],
-      stdout: "inherit",
-      stdin: "pipe",
-      stderr: "inherit",
-    });
-  } catch (e) {
-    console.error("Failed to start voice recorder:", e);
-  }
-
-  try {
-    _effectsProc = Bun.spawn({
-      cmd: [
-        "pw-record",
-        "--channels=2",
-        "--rate=48000",
-        "--properties",
-        `media.name=webcam_effects,node.name=webcam_effects,application.name=TheaterWebCam-Effects`,
-        effectsPath,
-      ],
-      stdout: "inherit",
-      stdin: "pipe",
-      stderr: "inherit",
-    });
-  } catch (e) {
-    console.error("Failed to start effects recorder:", e);
-  }
-
   try {
     _videoProc = Bun.spawn({
       env: {
@@ -157,61 +118,102 @@ if (RECORD) {
         GST_DEBUG: "3",
       },
       cmd: [
-        "gst-launch-1.0",
-        "-e",
-        "-v",
-        "v4l2src",
-        `device=${DEVICE}`,
-        "do-timestamp=true",
-        "io-mode=2",
-        "!",
-        `image/jpeg,width=${WIDTH},height=${HEIGHT},framerate=${FRAMERATE}/1`,
-        "!",
-        "jpegdec",
-        "!",
-        "videoconvert",
-        "qos=true",
-        "!",
-        "tee",
-        "name=t",
-        // video preview branch
-        "t.",
-        "!",
-        "queue",
-        "max-size-buffers=2",
-        "max-size-bytes=0",
-        "max-size-time=0",
-        "leaky=2",
-        "!",
-        "autovideosink",
-        "sync=false",
-        // recording branch
-        "t.",
-        "!",
-        "queue",
-        "max-size-buffers=600",
-        "max-size-bytes=0",
-        "max-size-time=0",
-        "leaky=2",
-        "!",
-        "x264enc",
-        "speed-preset=6",
-        "bitrate=8192",
-        "key-int-max=60",
-        "qp-min=10",
-        //"tune=film",
-        "!",
-        "h264parse",
-        "!",
-        "queue",
-        "max-size-buffers=300",
-        "leaky=2",
-        "!",
-        "matroskamux",
-        "!", 
-        "filesink",
-        `location=${DIR_NAME}/webcam_video.mkv`,
-      ],
+  "gst-launch-1.0", "-v", "-e",
+  // 1. Add a small latency to the muxer so it doesn't choke waiting for audio
+  "matroskamux",
+    "name=mux",
+    "offset-to-zero=true",
+    "latency=200000000",
+    "!",
+  "filesink",
+    `location=./${DIR_NAME}/webcam_full.mkv`,
+    //"async=false",
+
+  // --- VIDEO SOURCE ---
+  "pipewiresrc",
+    `target-object=${DEVICE}`,
+    "do-timestamp=true",
+    "!",
+  `image/jpeg,width=${WIDTH},height=${HEIGHT},framerate=${FRAMERATE}/1`,
+    "!",
+  "queue",
+    "leaky=downstream",
+    "max-size-buffers=2",
+    "!",
+  "jpegdec", "!",
+  "videorate",
+    //"drop-only=true",
+    "skip-to-first=true",
+    "!",
+  `video/x-raw,framerate=${FRAMERATE}/1`, // IMPORTANT: Force the framerate to be stable before the tee
+    "!",
+  "tee",
+    "name=t",
+    // --- VIDEO BRANCHES ---
+
+    // Branch 1: Preview (queue is mandatory here to unblock the tee)
+    "t.",
+      "!",
+    "queue",
+      "leaky=downstream",
+      "!", 
+    "autovideosink",
+      "sync=false",
+      // "async=false", no such thing for sink
+
+    // Branch 2: Recording
+    "t.",
+      "!",
+    "queue",
+      "max-size-buffers=300",
+      "!", 
+    "x264enc",
+      "speed-preset=ultrafast",
+      "tune=zerolatency",
+      "bitrate=8192",
+      "!", 
+    "h264parse",
+      "!",
+    "mux.video_0",
+
+  // --- VOICE AUDIO ---
+  "pipewiresrc",
+    "client-name=TheaterWebCam",
+    "stream-properties=props,media.name=voice",
+    "do-timestamp=true",
+    "!",
+  "audio/x-raw,channels=1,rate=48000", // <--- CAPS FORCE MONO
+    "!", 
+  "queue",
+    "leaky=2",
+    "max-size-time=3000000000",
+    "max-size-buffers=0",
+    "!",
+  "audioconvert", // convert to raw audio
+    "!", 
+  "audioresample", // resample if needed
+    "!",
+  "mux.audio_0", // end branch by connecting to muxer
+
+  // --- EFFECTS AUDIO ---
+  "pipewiresrc",
+    "client-name=TheaterWebCam",
+    "stream-properties=props,media.name=effects",
+    "do-timestamp=true",
+    "!",
+  "audio/x-raw,channels=2,rate=48000", // <--- CAPS FORCE MONO
+    "!", 
+  "queue",
+    "leaky=2",
+    "max-size-time=3000000000",
+    "max-size-buffers=0",
+    "!",
+  "audioconvert", // convert to raw audio
+    "!", 
+  "audioresample", // resample if needed
+    "!",
+  "mux.audio_1", // end branch by connecting to muxer
+],
       stdout: "inherit",
       stdin: "pipe",
       stderr: "inherit",
@@ -225,11 +227,8 @@ if (RECORD) {
     _videoProc = Bun.spawn({
       cmd: [
         "gst-launch-1.0",
-        "-v",
         "v4l2src",
         `device=${DEVICE}`,
-        "do-timestamp=true",
-        "io-mode=2",
         "!",
         `image/jpeg,width=${WIDTH},height=${HEIGHT},framerate=${FRAMERATE}/1`,
         "!",
@@ -242,7 +241,7 @@ if (RECORD) {
         "max-size-buffers=2",
         "max-size-bytes=0",
         "max-size-time=0",
-        "leaky=2",
+        "leaky=downstream",
         "!",
         "autovideosink",
         "sync=false",
@@ -256,45 +255,15 @@ if (RECORD) {
   }
 }
 
-// Helper: wait for a promise to resolve within `ms` milliseconds
-const waitFor = async (p: Promise<number>, ms: number) => {
-  try {
-    return await Promise.race([p.then(() => true), new Promise<boolean>((res) => setTimeout(() => res(false), ms))]);
-  } catch (e) {
-    return true; // treat rejection as finished
-  }
-};
-
-// Kill a subprocess gracefully: send SIGINT, wait, then SIGTERM if still alive
-const killAndAwait = async (proc: Bun.Subprocess | null) => {
-  if (!proc) return;
-  try {
-    proc.kill("SIGINT");
-  } catch (e) {}
-  // Also send SIGINT to the child process group so gst-launch and its
-  // children receive it and can flush/emit EOS to finalize files.
-  try {
-    const pid = (proc as any).pid as number | undefined;
-    if (typeof pid === "number" && pid > 0) {
-      try {
-        process.kill(-pid, "SIGINT");
-      } catch (e) {}
-    }
-  } catch (e) {}
-
-  // Give longer time for gst pipeline to flush and mp4mux to finalize
-  const finished = await waitFor(proc.exited, 8000);
-  if (!finished) {
-    try {
-      proc.kill("SIGTERM");
-    } catch (e) {}
-    // give it a bit more time to terminate
-    await waitFor(proc.exited, 3000);
-  }
-};
-
 const exit = async () => {
-  await Promise.all([killAndAwait(_videoProc), killAndAwait(_voiceProc), killAndAwait(_effectsProc)]);
+  console.log("Exiting, stopping subprocesses...");
+  if (_videoProc) {
+    console.log("Stopping video process...");
+    _videoProc.kill("SIGINT");
+    await _videoProc.exited;
+    console.log("Video process stopped.");
+  }
+  console.log("All subprocesses stopped.");
 };
 
 // stop everything and await exit
@@ -321,3 +290,25 @@ process.on("unhandledRejection", async (reason, promise) => {
 
 console.log("Webcam streaming started. Press Ctrl+C to stop.");
 // the process will keep running until sub processes are killed
+
+{
+  // give the cam some time to start up
+  await new Promise((r) => setTimeout(r, 500));
+  //configure the web cam settings
+  //Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=white_balance_automatic=0`;
+  //Bun.$`v4l2-ctl -d ${DEVICE} --set-ctrl=white_balance_temperature=4500`;
+
+  await Bun.$`v4l2-ctl -d ${v4l2_DEVICE} --set-ctrl=auto_exposure=1`;
+  await Bun.$`v4l2-ctl -d ${v4l2_DEVICE} --set-ctrl=exposure_time_absolute=400`;
+  await Bun.$`v4l2-ctl -d ${v4l2_DEVICE} --set-ctrl=gain=0`;
+  await Bun.$`v4l2-ctl -d ${v4l2_DEVICE} --set-ctrl=backlight_compensation=0`;
+  await Bun.$`v4l2-ctl -d ${v4l2_DEVICE} --set-ctrl=zoom_absolute=300`;
+
+  if (FOCUS !== undefined) {
+    console.log(`Focus set to: ${FOCUS}`);
+    await Bun.$`v4l2-ctl -d ${v4l2_DEVICE} --set-ctrl=focus_automatic_continuous=0`;
+    await Bun.$`v4l2-ctl -d ${v4l2_DEVICE} --set-ctrl=focus_absolute=${FOCUS}`;
+  }
+  //Bun.$`v4l2-ctl -d ${v4l2_DEVICE} --set-ctrl=pan_absolute=3600`;
+  //Bun.$`v4l2-ctl -d ${v4l2_DEVICE} --set-ctrl=tilt_absolute=3600`;
+}
