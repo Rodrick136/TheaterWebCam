@@ -84,6 +84,7 @@ const v4l2_DEVICE = (
 ).trim();
 const devices = JSON.parse((await Bun.$`pw-dump`.text()).trim());
 const webcams = [];
+const default_sources = [];
 for (const device of devices) {
   if (device.type === "PipeWire:Interface:Node") {
     const props = device.info.props;
@@ -95,6 +96,15 @@ for (const device of devices) {
         node_name: props["node.name"],
       });
     }
+    if (props["media.class"] === "Audio/Source") {
+      //console.log(device);
+      default_sources.push({
+        id: device.id,
+        description: props["node.description"],
+        node_name: props["node.name"],
+      });
+    }
+    
   }
 }
 if (webcams.length === 0) {
@@ -143,15 +153,28 @@ if (vaapiAvailable) {
 }
 
 let _videoProc: Bun.Subprocess<"pipe", "inherit", "inherit"> | null = null;
-let _audioProc: Bun.Subprocess<"pipe", "inherit", "inherit"> | null = null;
-let audioModule: string | null = null;
+//let _audioProc: Bun.Subprocess<"pipe", "inherit", "inherit"> | null = null;
+let audioModule: number | null = null;
 if (RECORD) {
   try {
     // create a virtual audio sink with 3 channels
-    audioModule = (
-      await Bun.$`pactl load-module module-null-sink sink_name=virtual3 channels=3 channel_map=front-left,front-right,front-center`.text()
-    ).trim();
-    console.log("Created virtual audio sink with module ID:", audioModule);
+    const sink_name = "TheaterWebcam-AUDIO_SINK";
+    {
+      const json_string = (
+        await Bun.$`pactl -f json load-module module-null-sink sink_name=${sink_name} channels=3 channel_map=mono,left,right`.text()
+      ).trim();
+      const json = JSON.parse(json_string);
+      audioModule = json.index;
+      console.log(`Created virtual audio sink with module ID:`, sink_name, audioModule);
+
+      // connect sink_name to default capture source
+      const default_source = default_sources[0];
+      if (default_source) {
+        await Bun.$`pw-link ${default_source.node_name}:capture_FL ${sink_name}:playback_FL`;
+        await Bun.$`pw-link ${default_source.node_name}:capture_FR ${sink_name}:playback_FR`;
+        console.log(`Connected default capture to virtual audio sink`);
+      }
+    }
 
     // prettier-ignore
     const vaapiCmd = [
@@ -179,7 +202,7 @@ if (RECORD) {
       "h264parse", "!",
       "mux.video_0",
 
-      "pulsesrc", `client-name=TheaterWebcam-AUDIO`, "device=virtual3.monitor", "!",
+      "pulsesrc", `client-name=TheaterWebcam-AUDIO`, `device=${sink_name}.monitor`, "!",
       "audio/x-raw,channels=3", "!",
       "queue", "leaky=downstream", "max-size-time=3000000000", "max-size-buffers=0", "!",
       "audioconvert", "!", 
@@ -211,7 +234,7 @@ if (RECORD) {
       "h264parse", "!",
       "mux.video_0",
 
-      "pulsesrc", `client-name=TheaterWebcam-AUDIO`, "device=virtual3.monitor", "!",
+      "pulsesrc", `client-name=TheaterWebcam-AUDIO`, `device=${sink_name}.monitor`, "!",
       "audio/x-raw,channels=3", "!",
       "queue", "leaky=downstream", "max-size-time=3000000000", "max-size-buffers=0", "!",
       "audioconvert", "!", 
@@ -258,33 +281,57 @@ if (RECORD) {
   // just play the video without recording
   try {
     const vaapiViewCmd = [
-      "gst-launch-1.0", "-v", "-e",
-      "v4l2src", `device=${v4l2_DEVICE}`, "!",
-      `image/jpeg,width=${WIDTH},height=${HEIGHT},framerate=${FRAMERATE}/1`, "!",
-      "queue", "leaky=downstream", "max-size-buffers=2", "!",
-      "jpegparse", "!", 
-      "vaapijpegdec", "!",
-      "vaapipostproc", "!",
+      "gst-launch-1.0",
+      "-v",
+      "-e",
+      "v4l2src",
+      `device=${v4l2_DEVICE}`,
+      "!",
+      `image/jpeg,width=${WIDTH},height=${HEIGHT},framerate=${FRAMERATE}/1`,
+      "!",
+      "queue",
+      "leaky=downstream",
+      "max-size-buffers=2",
+      "!",
+      "jpegparse",
+      "!",
+      "vaapijpegdec",
+      "!",
+      "vaapipostproc",
+      "!",
       // split to two display branches
-      "tee", "name=t", 
-      "t.", "!",
-      "queue", "leaky=downstream", "!",
-      "vaapisink", "sync=false",
-      "t.", "!",
-      "queue", "leaky=downstream", "!",
-      "autovideosink", "sync=false",
+      "tee",
+      "name=t",
+      "t.",
+      "!",
+      "queue",
+      "leaky=downstream",
+      "!",
+      "vaapisink",
+      "sync=false",
+      "t.",
+      "!",
+      "queue",
+      "leaky=downstream",
+      "!",
+      "autovideosink",
+      "sync=false",
     ];
 
     const cpuViewCmd = [
       "gst-launch-1.0",
-      "v4l2src", `device=${v4l2_DEVICE}`, "!",
+      "v4l2src",
+      `device=${v4l2_DEVICE}`,
+      "!",
       `image/jpeg,width=${WIDTH},height=${HEIGHT},framerate=${FRAMERATE}/1`,
       "!",
       "jpegdec",
       "!",
       // split to two display branches
-      "tee", "name=t", 
-      "t.", "!",
+      "tee",
+      "name=t",
+      "t.",
+      "!",
       "queue",
       "max-size-buffers=2",
       "max-size-bytes=0",
@@ -293,7 +340,8 @@ if (RECORD) {
       "!",
       "autovideosink",
       "sync=false",
-      "t.", "!",
+      "t.",
+      "!",
       "queue",
       "max-size-buffers=2",
       "max-size-bytes=0",
@@ -330,7 +378,7 @@ const exit = async () => {
   // cleanup the virtual audio sink
   if (audioModule) {
     try {
-      console.log("Unloading virtual audio sink...");
+      console.log(`Unloading virtual audio sink:"${audioModule}"`);
       await Bun.$`pactl unload-module ${audioModule}`;
       console.log("Virtual audio sink unloaded.");
     } catch (e) {
