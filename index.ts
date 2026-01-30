@@ -151,14 +151,7 @@ if (RECORD) {
     audioModule = (
       await Bun.$`pactl load-module module-null-sink sink_name=virtual3 channels=3 channel_map=front-left,front-right,front-center`.text()
     ).trim();
-
-    const props = [
-      "stream-properties=props",
-      "media.name=AUDIO",
-      "media.role=Production",
-      "node.always-process=true",
-    ].join(",");
-    console.log("Audio PipeWire source properties:", props);
+    console.log("Created virtual audio sink with module ID:", audioModule);
 
     // prettier-ignore
     const vaapiCmd = [
@@ -186,7 +179,7 @@ if (RECORD) {
       "h264parse", "!",
       "mux.video_0",
 
-      "pipewiresrc", props, "target-object=virtual3", "!",
+      "pulsesrc", `client-name=TheaterWebcam-AUDIO`, "device=virtual3.monitor", "!",
       "audio/x-raw,channels=3", "!",
       "queue", "leaky=downstream", "max-size-time=3000000000", "max-size-buffers=0", "!",
       "audioconvert", "!", 
